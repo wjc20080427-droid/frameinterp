@@ -1,0 +1,14 @@
+# Build output
+.build/
+*.app/
+*.dmg
+
+# Promo media and old release packages (large, not source)
+dist/
+
+# macOS
+.DS_Store
+
+# Old promo screenshot and generated icon files
+promo/
+build-assets/

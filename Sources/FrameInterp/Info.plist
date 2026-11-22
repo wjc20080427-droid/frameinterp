@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>local.frameinterp</string>
+    <key>CFBundleName</key><string>FrameInterp</string>
+    <key>NSCameraUsageDescription</key><string>Reads the capture card picture for frame interpolation. 读取采集卡画面用于补帧。</string>
+    <key>NSMicrophoneUsageDescription</key><string>Plays the capture card audio through your speakers. 把采集卡的声音直通到扬声器。</string>
+</dict>
+</plist>
