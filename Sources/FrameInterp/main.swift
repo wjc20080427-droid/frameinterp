@@ -69,7 +69,43 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
     /// 1080p 补帧在这台 Mac 上预热失败时自动改用 720p（2026-11-21：别人的 Mac 上报 -19730 "Processor is not initialized"）
     /// 网上多个项目实测：macOS 26.x 上 Apple 低延迟补帧最多处理 1280×720 的像素量（超了 startSession 不报错，process 报 -19730），
     /// 27 才放宽到 1080p。用户反馈的两台（M2 26.6、M4 26.5.2）都是 26.x。所以 26.x 上一开始就用 720p 补帧，不用先等 10 秒失败
-    var autoProc720 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27
+    /// 2026-11-23 B 站用户反馈：M1 Pro + macOS 27，1080p 补帧打开后只有 10 帧。Apple 论坛也有人实测 M1 Pro 低延迟补帧最大 720p，
+    /// Console Link 等软件在 M1 Pro 上也只支持 720p。所以 M1 系列芯片一开始就用 720p 补帧；其他芯片补帧太慢时也会自动降到 720p（见 checkInterpSpeed）
+    var autoProc720 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27 || App.isM1Family
+    /// 为什么用 720p 补帧（状态里说明）
+    var proc720Reason: String {
+        if ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27 { return "（macOS 26 只支持 720p 补帧，升级到 macOS 27 可用 1080p）" }
+        if App.isM1Family && !slowSwitched { return "（M1 系列芯片 1080p 补帧太慢，自动用 720p）" }
+        if slowSwitched { return "（1080p 补帧在这台 Mac 上太慢，自动改用 720p）" }
+        return "（这台 Mac 上 1080p 补帧不可用，自动用 720p）"
+    }
+    var slowSwitched = false
+    private var slowSeconds = 0
+    static var isM1Family: Bool {
+        var size = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        var buf = [CChar](repeating: 0, count: max(size, 1))
+        sysctlbyname("machdep.cpu.brand_string", &buf, &size, nil, 0)
+        let b = String(cString: buf)
+        return b.hasPrefix("Apple M1")
+    }
+
+    /// 补帧跟不上（每帧太慢，或者开着补帧显示帧率掉得很低）连续 3 秒：自动改用 720p 补帧
+    func checkInterpSpeed(_ snap: StatsSnapshot) {
+        guard pipeline?.interpActive == true, !autoProc720, let vt = interp, vt.height > 720, snap.unique >= 15 else { slowSeconds = 0; return }
+        // 30 帧左右的游戏补帧后应接近翻倍；60 帧的游戏本来就不用补，不按显示帧率判断。FI_FAKE_SLOW=1 测试用
+        let slow = ProcessInfo.processInfo.environment["FI_FAKE_SLOW"] == "1"
+            || (snap.interpDone > 0 && snap.interpAvg > 28)
+            || (snap.unique <= 40 && snap.displayed < Int(Double(snap.unique) * 1.3))
+        slowSeconds = slow ? slowSeconds + 1 : 0
+        guard slowSeconds >= 3, let cur = source else { return }
+        slowSeconds = 0
+        autoProc720 = true
+        slowSwitched = true
+        Log.write("补帧太慢（每帧 \(f1(snap.interpAvg))ms，游戏 \(snap.unique) → 显示 \(snap.displayed)），自动改用 720p 补帧（\(App.machineInfo)）")
+        view?.flash("1080p 补帧太慢，自动改用 720p 补帧…")
+        Task { await switchTo(cur, force: true) }
+    }
 
     /// 芯片、型号、系统版本（写日志、报错时显示）
     static var machineInfo: String {
@@ -1005,9 +1041,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
                 } else {
                     Log.write("补帧就绪：startSession \(Int(vt.startMs))ms，预热 \(Int(vt.warmupMs))ms")
                     self.view?.flash(self.autoProc720 ? "补帧就绪（这台 Mac 用 720p 补帧）" : "补帧就绪")
-                    self.model.interpStatus = "Apple 低延迟补帧 · 已就绪" + (!self.autoProc720 ? ""
-                        : ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27
-                        ? "（macOS 26 只支持 720p 补帧，升级到 macOS 27 可用 1080p）" : "（这台 Mac 上 1080p 补帧不可用，自动用 720p）")
+                    self.model.interpStatus = "Apple 低延迟补帧 · 已就绪" + (self.autoProc720 ? self.proc720Reason : "")
                 }
             }
         }
@@ -1144,6 +1178,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
                                   queueDepth: pipeline?.queue.count ?? 0, backend: "vt")
         if pipeline != nil {
             Log.write(snap.line)
+            checkInterpSpeed(snap)
             if let gs = pipeline?.textGuards, pipeline?.interpActive == true {
                 let on = gs.filter { $0.enabled && $0.maskCount > 0 }
                 if !on.isEmpty { Log.write("  字幕 / 提示保护：" + on.map { "\($0.name) \($0.maskCount)" }.joined(separator: "，") + " 像素") }
