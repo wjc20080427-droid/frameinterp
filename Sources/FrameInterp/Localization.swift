@@ -182,8 +182,9 @@ enum EN {
         "GTA 6 内部 1440p（TAA 放大），30 帧，偶尔掉到 20 出头": "GTA 6: 1440p internal (TAA upscaling), 30 fps, occasionally low 20s",
         "GTA 6 内部 720p，FSR 放大到约 1080p，二十多到 30 帧": "GTA 6: 720p internal, FSR upscaled to about 1080p, 20s to 30 fps",
         "1440p（菜单里没有就选 4K）": "1440p (4K if 1440p isn't in the menu)",
-        "PSSR 重建出来的细节只有输出 4K 才拿得到": "PSSR-reconstructed detail is only available with 4K output",
+        "PSSR 重建出来的细节只有输出 2160p 才拿得到": "PSSR-reconstructed detail is only available with 2160p output",
         "游戏内部就是 1440p，输出 4K 会先被主机放大、再被采集卡缩回来，多两次缩放": "The game renders at 1440p; 4K output is upscaled by the console and scaled back down by the capture card — two extra resamples",
+        "游戏按输出分辨率重建画面，输出 2160p 细节最多；采集 1080p 时正好缩小 2 倍，画面最干净": "The game reconstructs the image at the output resolution, so 2160p output has the most detail; capturing at 1080p is then an exact 2× downscale — the cleanest picture",
         "内部只有 720p、放大到约 1080p，输出更高没有更多细节": "Only 720p internally, upscaled to about 1080p; higher output adds no detail",
         "PSSR 本来就很锐，再锐化容易出白边": "PSSR is already sharp; more sharpening causes halos",
         "TAA 放大的画面偏软一点": "TAA upscaling looks a little soft", "内部只有 720p，画面最软": "Only 720p internally — the softest picture",
@@ -226,6 +227,24 @@ enum EN {
         "— FPS   延迟 —": "— FPS   Latency —", "无": "None", "不缩放": "no scaling", "三次插值": "cubic", "按比例取样（防闪烁）": "area sampling (anti-flicker)",
         "不锐化": "no sharpening", "这台机器不支持 VTLowLatencyFrameInterpolation": "This Mac doesn't support VTLowLatencyFrameInterpolation",
         "远程游玩": "Remote Play", "未知": "Unknown",
+        // 模拟器（2026-11-24）
+        "模拟器": "Emulator", "未发现模拟器": "No emulator found", "支持的模拟器": "Supported emulators", "多平台": "Multi-system",
+        "从 Dolphin、PCSX2、RetroArch 等模拟器的窗口取画面补帧（2 倍）。手柄要在模拟器里打开后台输入。":
+            "Interpolates (2×) the window of an emulator such as Dolphin, PCSX2 or RetroArch. Turn on background input in the emulator so the controller works.",
+        "这些模拟器的窗口会被自动认出来，排在窗口列表前面。列表外的模拟器也能用，在「选其他窗口」里选它的窗口就行":
+            "Windows of these emulators are recognized automatically and listed first. Other emulators work too — pick their window under \"Choose another window\".",
+        "· 键盘鼠标操作不了：FrameInterp 在前台显示补帧画面，键盘鼠标会被它收走，请用手柄":
+            "· Keyboard and mouse won't reach the emulator: FrameInterp is in front showing the interpolated picture. Use a controller.",
+        "· 补帧会多 30～50ms 延迟。60 帧补到 120 主要是看起来更顺":
+            "· Interpolation adds 30–50 ms of latency. Going from 60 to 120 fps mainly makes motion look smoother.",
+        "模拟器的窗口排在前面。手柄要在模拟器里打开后台输入。": "Emulator windows are listed first. Turn on background input in the emulator for the controller.",
+        "在模拟器设置里打开「后台输入（Background Input）」，关掉「失去焦点时暂停（Pause on focus loss）」":
+            "In the emulator's settings, turn on Background Input and turn off Pause on focus loss",
+        "控制器设置（Controllers）里勾选「Background Input」，不然 FrameInterp 在前台时手柄没反应":
+            "In Controllers, tick Background Input — otherwise the controller does nothing while FrameInterp is in front",
+        "设置 → Interface 里关掉「Pause On Focus Loss」": "Settings → Interface: turn off Pause On Focus Loss",
+        "设置 → System 里关掉「Pause when not focused」": "Settings → System: turn off Pause when not focused",
+        "设置 → User Interface 里关掉「Pause Content When Not Active」": "Settings → User Interface: turn off Pause Content When Not Active",
     ]
 
     /// 带数字 / 名字的句子：{} 是会变的部分
@@ -245,6 +264,9 @@ enum EN {
         ("设置 → 常规 → 电视和显示选项：分辨率 {}，刷新率 60Hz；视频模式里关掉 HDR10、自动 HDR、VRR", "Settings → General → TV & display options: resolution {1}, refresh rate 60 Hz; in Video modes turn off HDR10, Auto HDR and VRR"),
         ("· 设置 → 屏幕和视频 → 视频输出：分辨率 {}，HDR 关，VRR 关，120Hz 输出 关", "· Settings → Screen and Video → Video Output: resolution {1}, HDR off, VRR off, 120 Hz output off"),
         ("· 设置 → 常规 → 电视和显示选项：分辨率 {}，刷新率 60Hz；视频模式里关掉 HDR10、自动 HDR、VRR", "· Settings → General → TV & display options: resolution {1}, refresh rate 60 Hz; in Video modes turn off HDR10, Auto HDR and VRR"),
+        ("{} · 最高 {} 帧", "{1} · max {2} fps"), ("{}（{} 帧）", "{1} ({2} fps)"),
+        ("采集卡这一档最高只有 {} 帧，比主机输出的少，画面会掉帧。玩游戏建议选能跑满 {} 帧的档",
+         "The capture card only does up to {1} fps at this resolution — less than the console outputs, so frames will drop. For gaming, pick a resolution that reaches {2} fps."),
     ].map { pair -> (NSRegularExpression, String) in
         let pattern = "^" + NSRegularExpression.escapedPattern(for: pair.0).replacingOccurrences(of: "\\{\\}", with: "(.+?)") + "$"
         return (try! NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]), pair.1)

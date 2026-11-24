@@ -12,6 +12,7 @@ struct SourceOption: Identifiable, Hashable {
     var windowTitle = ""     // 窗口：标题
     var streaming = false    // 窗口：是串流 App
     var unsupported = false  // 窗口：暂不支持（浏览器里的 Xbox 网页串流）
+    var emulator = ""        // 窗口：是哪个模拟器的（Emulator.name），空 = 不是模拟器
     var size = ""            // 窗口：大小（点）
 
     static func == (a: SourceOption, b: SourceOption) -> Bool { a.id == b.id }
@@ -55,6 +56,7 @@ final class UIModel: ObservableObject {
     // 输入
     @Published var captureHeight = 1080      // 想要的采集分辨率：1080 / 1440 / 2160
     @Published var availableHeights: [Int] = [1080, 1440, 2160] // 当前设备支持的档
+    @Published var heightMaxFps: [Int: Int] = [:] // 采集卡每档最高帧率（空 = 不知道 / 不是采集卡）
     @Published var sourceW = 0               // 实际采集到的尺寸
     @Published var sourceH = 0
     @Published var audioOn = true            // 声音直通（关 = 静音）
@@ -62,6 +64,8 @@ final class UIModel: ObservableObject {
     @Published var inputMode = 0             // 设置里的输入类型：0 采集卡 / 1 串流窗口
     @Published var screenAccess = false      // 有没有录屏权限（读窗口画面要它）
     @Published var showWindowPicker = false
+    @Published var windowKind = 0            // 首页窗口卡片 / 窗口选择器的分页：0 串流 / 1 模拟器
+    @Published var showEmulatorList = false  // 支持的模拟器列表
     @Published var showWizard = false       // 配置向导
     var onOpenWizard: () -> Void = {}
     var wizard: WizardModel?
@@ -239,6 +243,10 @@ struct RootView: View {
                     WindowPicker(model: model)
                         .transition(.opacity)
                 }
+                if model.showEmulatorList {
+                    EmulatorList(model: model)
+                        .transition(.opacity)
+                }
                 if model.showWizard, let w = model.wizard {
                     SetupWizardView(w: w)
                         .transition(.opacity)
@@ -260,6 +268,7 @@ struct RootView: View {
         .animation(.easeOut(duration: 0.18), value: model.showSettings)
         .animation(.easeOut(duration: 0.18), value: model.showWindowPicker)
         .animation(.easeOut(duration: 0.18), value: model.showWizard)
+        .animation(.easeOut(duration: 0.18), value: model.showEmulatorList)
         .animation(.easeOut(duration: 0.25), value: model.chromeVisible)
     }
 }
@@ -455,6 +464,9 @@ struct IdleView: View {
 /// 首页的来源卡片外框：上面图标 + 标题 + 状态，中间说明，下面按钮
 struct SourceCard<Actions: View>: View {
     let icon: String, title: String, status: String, statusOn: Bool, detail: String, tint: Color
+    var tabs: [String] = []                 // 有的话标题下面显示分页（串流 / 模拟器）
+    var tab = 0
+    var onTab: (Int) -> Void = { _ in }
     @ViewBuilder let actions: Actions
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -469,6 +481,7 @@ struct SourceCard<Actions: View>: View {
                     Text(status).font(.system(size: 11, weight: .medium)).foregroundStyle(statusOn ? Theme.ok : Theme.muted).lineLimit(1)
                 }
             }
+            if !tabs.isEmpty { Segmented(labels: tabs, selection: tab, onSelect: onTab) }
             Text(detail).font(.system(size: 12)).foregroundStyle(Theme.muted).lineSpacing(2)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -501,26 +514,88 @@ struct CaptureSourceCard: View {
     }
 }
 
-/// 串流窗口（PS Remote Play、Moonlight、Chiaki…；网页版 Xbox 串流暂不支持）
+/// 窗口来源：分两页——串流（PS Remote Play、Moonlight、Chiaki…；网页版 Xbox 串流暂不支持）和模拟器（Dolphin、PCSX2…）。
+/// 两者都是抓窗口画面补帧，但要做的准备不同，分开说明、分开找窗口
 struct WindowSourceCard: View {
     @ObservedObject var model: UIModel
     var body: some View {
-        let streams = model.windowOptions.filter(\.streaming)
-        SourceCard(icon: "macwindow.on.rectangle", title: "串流窗口",
-                   status: !model.screenAccess ? "需要录屏权限" : (streams.first.map { $0.app } ?? "未发现串流 App"),
-                   statusOn: model.screenAccess && !streams.isEmpty,
-                   detail: model.screenAccess
-                       ? "从 PS Remote Play、Moonlight、Chiaki 等串流 App 的窗口取画面补帧，不用采集卡。暂不支持网页版 Xbox 串流（xbox.com/play）"
-                       : "要读取别的 App 的窗口，需要在系统设置里打开「录屏与系统录音」权限。",
-                   tint: Theme.violet) {
+        let emu = model.windowKind == 1
+        let found = model.windowOptions.filter { emu ? !$0.emulator.isEmpty : $0.streaming }
+        let status = !model.screenAccess ? "需要录屏权限"
+            : (found.first.map { $0.app } ?? (emu ? "未发现模拟器" : "未发现串流 App"))
+        let detail = !model.screenAccess
+            ? "要读取别的 App 的窗口，需要在系统设置里打开「录屏与系统录音」权限。"
+            : emu
+                ? L("从 Dolphin、PCSX2、RetroArch 等模拟器的窗口取画面补帧（2 倍）。手柄要在模拟器里打开后台输入。") + (Lang.english ? " " : "") + Emulator.refreshNote
+                : "从 PS Remote Play、Moonlight、Chiaki 等串流 App 的窗口取画面补帧，不用采集卡。暂不支持网页版 Xbox 串流（xbox.com/play）"
+        SourceCard(icon: emu ? "gamecontroller" : "macwindow.on.rectangle", title: "窗口",
+                   status: status, statusOn: model.screenAccess && !found.isEmpty, detail: detail, tint: Theme.violet,
+                   tabs: ["串流", "模拟器"], tab: model.windowKind, onTab: { model.windowKind = $0 }) {
             if !model.screenAccess {
                 PillButton(title: "授权录屏", icon: "lock.open", filled: false) { model.onOpenWindowPicker() }
-            } else if let first = streams.first {
+            } else if let first = found.first {
                 PillButton(title: "连接", icon: "bolt.fill", filled: true) { model.onSelect(first.source) }
                 PillButton(title: "选其他窗口", icon: "rectangle.on.rectangle", filled: false) { model.onOpenWindowPicker() }
             } else {
                 PillButton(title: "选择窗口", icon: "rectangle.on.rectangle", filled: false) { model.onOpenWindowPicker() }
             }
+            if emu {
+                PillButton(title: "支持的模拟器", icon: "list.bullet", filled: false) { model.showEmulatorList = true }
+            }
+        }
+    }
+}
+
+/// 支持的模拟器：名字、主机、要在模拟器里改什么
+struct EmulatorList: View {
+    @ObservedObject var model: UIModel
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.6).ignoresSafeArea()
+                .onTapGesture { model.showEmulatorList = false }
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("支持的模拟器").font(.system(size: 16, weight: .bold))
+                        Text("这些模拟器的窗口会被自动认出来，排在窗口列表前面。列表外的模拟器也能用，在「选其他窗口」里选它的窗口就行")
+                            .font(.system(size: 12)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    IconSquare(icon: "xmark", help: "关闭") { model.showEmulatorList = false }
+                }
+                .padding(18)
+                Theme.border.frame(height: 1)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Emulator.all) { e in
+                            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(e.name).font(.system(size: 13, weight: .semibold))
+                                    Text(e.system).font(.system(size: 11)).foregroundStyle(Theme.faint)
+                                }
+                                .frame(width: 130, alignment: .leading)
+                                Text(e.tip).font(.system(size: 12)).foregroundStyle(Theme.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.vertical, 9)
+                            Theme.border.frame(height: 1)
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                }
+                .frame(maxHeight: 400)
+                VStack(alignment: .leading, spacing: 4) {
+                    Hint("· 键盘鼠标操作不了：FrameInterp 在前台显示补帧画面，键盘鼠标会被它收走，请用手柄")
+                    Hint("· " + Emulator.refreshNote)
+                    Hint("· 补帧会多 30～50ms 延迟。60 帧补到 120 主要是看起来更顺")
+                }
+                .padding(18)
+            }
+            .frame(width: 640)
+            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.border))
+            .shadow(color: .black.opacity(0.6), radius: 30, y: 10)
         }
     }
 }
@@ -575,6 +650,12 @@ struct WizardBanner: View {
 /// 选择窗口：每个窗口一张预览卡片，串流 App 排前面
 struct WindowPicker: View {
     @ObservedObject var model: UIModel
+    /// 当前分页要找的窗口排前面（串流页：串流 App；模拟器页：模拟器），其他保持原来的顺序
+    private var sortedWindows: [SourceOption] {
+        let w = model.windowOptions
+        let hit: (SourceOption) -> Bool = model.windowKind == 1 ? { !$0.emulator.isEmpty } : { $0.streaming }
+        return w.filter(hit) + w.filter { !hit($0) }
+    }
     var body: some View {
         ZStack {
             Color.black.opacity(0.6).ignoresSafeArea()
@@ -583,10 +664,12 @@ struct WindowPicker: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("选择要补帧的窗口").font(.system(size: 16, weight: .bold))
-                        Text("串流 App 的窗口排在前面。窗口可以放在任何地方，被挡住也没关系。")
+                        Text(model.windowKind == 1 ? "模拟器的窗口排在前面。手柄要在模拟器里打开后台输入。" : "串流 App 的窗口排在前面。窗口可以放在任何地方，被挡住也没关系。")
                             .font(.system(size: 12)).foregroundStyle(Theme.muted)
                     }
                     Spacer()
+                    Segmented(labels: ["串流", "模拟器"], selection: model.windowKind) { model.windowKind = $0 }
+                        .frame(width: 160)
                     IconSquare(icon: "arrow.clockwise", help: "刷新") { model.onOpenWindowPicker() }
                     IconSquare(icon: "xmark", help: "关闭") { model.showWindowPicker = false }
                 }
@@ -614,7 +697,7 @@ struct WindowPicker: View {
                 } else {
                     ScrollView {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 200, maximum: 260), spacing: 12)], spacing: 12) {
-                            ForEach(model.windowOptions) { o in WindowCard(model: model, option: o) }
+                            ForEach(sortedWindows) { o in WindowCard(model: model, option: o) }
                         }
                         .padding(18)
                     }
@@ -652,6 +735,10 @@ struct WindowCard: View {
                         Text("暂不支持").font(.system(size: 10, weight: .bold)).foregroundStyle(.black)
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Theme.amber, in: RoundedRectangle(cornerRadius: 4)).padding(6)
+                    } else if let e = Emulator.all.first(where: { $0.name == option.emulator }) {
+                        Text(L("模拟器") + " · " + L(e.system)).font(.system(size: 10, weight: .bold)).foregroundStyle(.black)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Theme.ok, in: RoundedRectangle(cornerRadius: 4)).padding(6)
                     } else if option.streaming {
                         Text("串流").font(.system(size: 10, weight: .bold)).foregroundStyle(.black)
                             .padding(.horizontal, 6).padding(.vertical, 2)
@@ -902,8 +989,11 @@ struct SettingsPanel: View {
             Field("窗口") {
                 HStack(spacing: 6) {
                     SelectField(text: model.windowOptions.first { $0.id == model.selectedID }?.title ?? "选择一个窗口") {
-                        let stream = model.windowOptions.filter(\.streaming), other = model.windowOptions.filter { !$0.streaming }
+                        let stream = model.windowOptions.filter(\.streaming)
+                        let emus = model.windowOptions.filter { !$0.streaming && !$0.emulator.isEmpty }
+                        let other = model.windowOptions.filter { !$0.streaming && $0.emulator.isEmpty }
                         if !stream.isEmpty { Section("串流 App") { ForEach(stream) { o in Button(o.title) { model.onSelect(o.source) } } } }
+                        if !emus.isEmpty { Section("模拟器") { ForEach(emus) { o in Button(o.title) { model.onSelect(o.source) } } } }
                         if !other.isEmpty { Section("其他窗口") { ForEach(other) { o in Button(o.title) { model.onSelect(o.source) } } } }
                         if model.windowOptions.isEmpty { Text("没有可用的窗口") }
                     }
@@ -922,6 +1012,11 @@ struct SettingsPanel: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+        }
+        if let cur = model.windowOptions.first(where: { $0.id == model.selectedID }),
+           let e = Emulator.all.first(where: { $0.name == cur.emulator }) {
+            Hint(e.fullTip)
+            Hint(Emulator.refreshNote)
         }
         SwitchLine(title: "自动裁掉标题栏和黑边", isOn: Binding(get: { model.windowAutoCrop }, set: { model.onWindowAutoCrop($0) }))
         Hint("游戏画面按 16:9 铺满、居中，不留黑边。开始后 3 秒内识别黑边；窗口大小变了会自动重新铺满。关掉则整个窗口按 16:9 铺满")
@@ -953,10 +1048,13 @@ struct SettingsPanel: View {
             Field("分辨率") {
                 SelectField(text: resTitle(model.captureHeight)) {
                     ForEach([1080, 1440, 2160], id: \.self) { h in
-                        Button(resTitle(h) + (model.availableHeights.contains(h) ? "" : " · 这个设备不支持")) { model.onCaptureHeight(h) }
+                        Button(resTitle(h) + resNote(h)) { model.onCaptureHeight(h) }
                             .disabled(!model.availableHeights.contains(h))
                     }
                 }
+            }
+            if let mx = model.heightMaxFps[model.captureHeight], mx < model.captureFps {
+                Hint("采集卡这一档最高只有 \(mx) 帧，比主机输出的少，画面会掉帧。玩游戏建议选能跑满 \(model.captureFps) 帧的档")
             }
             Field("帧率") {
                 SelectField(text: "\(model.captureFps) fps") {
@@ -997,6 +1095,13 @@ struct SettingsPanel: View {
                 OutlineButton(title: "选主机，一键配置", icon: "wand.and.stars", color: Theme.ok) { model.onOpenWizard() }
                     .padding(.top, 4)
             }
+    }
+
+    /// 菜单里每档后面的说明：没有这一档 → 不支持；有但跑不满所选帧率 → 标最高帧率
+    private func resNote(_ h: Int) -> String {
+        if !model.availableHeights.contains(h) { return " · 这个设备不支持" }
+        if let mx = model.heightMaxFps[h], mx < model.captureFps { return " · 最高 \(mx) 帧" }
+        return ""
     }
 
     private func resTitle(_ h: Int) -> String {

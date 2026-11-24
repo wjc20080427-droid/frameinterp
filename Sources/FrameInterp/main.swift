@@ -93,10 +93,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
     /// 补帧跟不上（每帧太慢，或者开着补帧显示帧率掉得很低）连续 3 秒：自动改用 720p 补帧
     func checkInterpSpeed(_ snap: StatsSnapshot) {
         guard pipeline?.interpActive == true, !autoProc720, let vt = interp, vt.height > 720, snap.unique >= 15 else { slowSeconds = 0; return }
-        // 30 帧左右的游戏补帧后应接近翻倍；60 帧的游戏本来就不用补，不按显示帧率判断。FI_FAKE_SLOW=1 测试用
+        // 30 帧左右的游戏补帧后应接近翻倍；60 帧的游戏在 60Hz 屏幕上不用补，不按显示帧率判断。FI_FAKE_SLOW=1 测试用
+        // 2026-11-24 加：120Hz 屏幕上 60 帧的游戏（模拟器、串流）要补到 120，每帧要在 16ms 内补完；
+        // M2 上 1080p 补一帧约 18～20ms 跟不上，补完显示不到 1.6 倍就改用 720p
+        let hiRefresh = (pipeline?.refreshMs ?? 16.7) < 10
         let slow = ProcessInfo.processInfo.environment["FI_FAKE_SLOW"] == "1"
             || (snap.interpDone > 0 && snap.interpAvg > 28)
             || (snap.unique <= 40 && snap.displayed < Int(Double(snap.unique) * 1.3))
+            || (hiRefresh && snap.unique >= 45 && snap.interpDone > 0 && snap.stillDirect == 0 && snap.displayed < Int(Double(snap.unique) * 1.6))
         slowSeconds = slow ? slowSeconds + 1 : 0
         guard slowSeconds >= 3, let cur = source else { return }
         slowSeconds = 0
@@ -186,6 +190,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
         // 测试用：FI_TOGGLEFS=秒数 启动后过这么久切换一次全屏
         if let v = ProcessInfo.processInfo.environment["FI_TOGGLEFS"], let sec = Double(v) {
             DispatchQueue.main.asyncAfter(deadline: .now() + sec) { MainActor.assumeIsolated { self.toggleFullScreen() } }
+        }
+        // 测试用：FI_WINKIND=1 首页窗口卡片打开在"模拟器"页；FI_EMULIST=1 启动后打开支持的模拟器列表
+        if ProcessInfo.processInfo.environment["FI_WINKIND"] == "1" { model.windowKind = 1 }
+        if ProcessInfo.processInfo.environment["FI_EMULIST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MainActor.assumeIsolated { self.model.showEmulatorList = true } }
         }
         // 测试用：FI_SHOWSETTINGS=1 启动后打开设置栏（截图检查界面）
         if ["1", "picture"].contains(ProcessInfo.processInfo.environment["FI_SHOWSETTINGS"] ?? "") {
@@ -434,9 +443,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
             }
             model.screenAccess = CGPreflightScreenCaptureAccess() || screenVerified
             let mine = ProcessInfo.processInfo.processIdentifier
-            // 串流 App 的窗口排在前面
+            // 串流 App 的窗口排在前面，模拟器其次
             let wins = cachedWindows.filter { $0.owningApplication?.processID != mine }
-                .sorted { WindowCapture.rank($0) < WindowCapture.rank($1) }
+                .sorted { (WindowCapture.rank($0), Emulator.match($0) == nil ? 1 : 0) < (WindowCapture.rank($1), Emulator.match($1) == nil ? 1 : 0) }
             for w in wins {
                 let app = w.owningApplication?.applicationName ?? "?"
                 let t = ((w.title ?? "").isEmpty ? app : "\(app) — \(w.title!)") + (!w.isOnScreen && WindowCapture.isNativeFullScreen(w) ? "（系统全屏）" : "")
@@ -444,6 +453,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
                 list.append(SourceOption(id: src.optionID, title: t, group: .window, source: src,
                                          app: app, windowTitle: w.title ?? "", streaming: WindowCapture.isStreaming(w) && !WindowCapture.isWebXbox(w),
                                          unsupported: WindowCapture.isWebXbox(w),
+                                         emulator: Emulator.match(w)?.name ?? "",
                                          size: "\(Int(w.frame.width))×\(Int(w.frame.height))"))
             }
             // 测试图案只在开发测试（--test / --selftest）时出现
@@ -604,6 +614,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
     func openWizard() {
         model.showSettings = false
         wizard.availableHeights = model.availableHeights
+        wizard.heightMaxFps = model.heightMaxFps
         wizard.captureHeight = model.availableHeights.contains(model.captureHeight) ? model.captureHeight : 1080
         wizard.captureFps = model.captureFps
         model.showWizard = true
@@ -919,6 +930,17 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
             test = t
             (w, h) = (t.width, t.height)
             model.availableHeights = [1080, 1440, 2160]
+            model.heightMaxFps = [:]
+            // 测试钩子：FI_FAKECAPS=1080:60,1440:30 假装采集卡只有这些档（看分辨率菜单的样子）
+            if let fake = ProcessInfo.processInfo.environment["FI_FAKECAPS"] {
+                var caps: [Int: Int] = [:]
+                for p in fake.split(separator: ",") {
+                    let kv = p.split(separator: ":").compactMap { Int($0) }
+                    if kv.count == 2 { caps[kv[0]] = kv[1] }
+                }
+                model.heightMaxFps = caps
+                model.availableHeights = caps.keys.sorted()
+            }
         case .device(let id, _):
             guard let d = Devices.video().first(where: { $0.uniqueID == id }) else {
                 return fail("找不到设备：\(s.label)（已拔出？）")
@@ -931,8 +953,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
             Devices.preferCompressed = model.captureMJPEG
             model.mjpegAvailable = d.formats.contains(where: Devices.isMJPEG)
             if attempt == 0 { Log.write("设备格式（\(d.formats.count) 个）：" + d.formats.map(Devices.describe).joined(separator: "；")) }
-            let avail = Devices.supportedHeights(d, fps: Double(model.captureFps))
-            model.availableHeights = avail.isEmpty ? [1080] : avail
+            let caps = Devices.heightMaxFps(d)
+            model.heightMaxFps = caps
+            model.availableHeights = caps.isEmpty ? [1080] : caps.keys.sorted()
             if !Devices.isScreenDevice(d) {
                 let cands = Devices.candidates(d, fps: Double(model.captureFps), height: model.captureHeight)
                 if !cands.isEmpty {
@@ -990,12 +1013,17 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
             c.configure(window: win, scale: scr?.backingScaleFactor ?? 2)
             wc = c
             fullScreenStream = !win.isOnScreen && WindowCapture.isNativeFullScreen(win) ? win : nil
+            if let e = Emulator.match(win) {
+                Log.write("模拟器窗口：\(e.name)（\(e.system)），屏幕 \(Emulator.screenHz)Hz")
+                view?.flash(e.shortTip)
+            }
             if WindowCapture.isWebXbox(win) {
                 Log.write("⚠ 选的是网页版 Xbox 串流（暂不支持：浏览器失去焦点会暂停画面）")
                 view?.flash("⚠ 网页版 Xbox 串流暂不支持：浏览器失去焦点会暂停画面")
             }
             (w, h) = (c.width, c.height)
             model.availableHeights = [1080]
+            model.heightMaxFps = [:]
         }
         guard gen == generation else { return }
 

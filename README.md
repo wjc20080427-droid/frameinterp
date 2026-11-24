@@ -15,6 +15,7 @@ result on your Mac's screen. Audio from the capture card is passed straight thro
 - **30 → 60 fps** with Apple's `VTLowLatencyFrameInterpolation` (runs on the Media Engine / Neural Engine, about 18 ms per frame on an M2).
 - **Capture cards**: any USB (UVC) capture card that macOS sees as a camera — Genki ShadowCast, Elgato, AVerMedia, MS2109-based cards… 1080p / 2K / 4K, 60 / 120 fps, automatic fallback when USB bandwidth is not enough.
 - **Streaming windows**: PS Remote Play, Moonlight, Chiaki and similar apps, captured at their native pixels. Windows in a separate full-screen Space are supported.
+- **Emulator windows**: Dolphin, PCSX2, DuckStation, PPSSPP, RetroArch, RPCS3 and other Mac emulators are recognized, with a list of the settings to change in each (background input, pause on focus loss). Use a controller: keyboard and mouse go to FrameInterp. A 60 fps game needs a 120 Hz screen to reach 120 fps.
 - **Subtitle & HUD guard**: subtitles and HUD elements that stay still are copied from the real frame, so they don't shimmer or warp in interpolated frames.
 - **Sharp scaling**: frames are scaled straight to the screen's physical pixels (Catmull-Rom upscaling, area-correct downscaling for 4K) with optional RCAS sharpening.
 - **Console presets**: pick PS5 / PS5 Pro / Xbox Series S / X and get recommended capture, interpolation and sharpening settings.

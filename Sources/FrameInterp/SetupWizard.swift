@@ -23,16 +23,16 @@ enum Console: Int, CaseIterable, Identifiable {
     /// 主机该输出多少
     var output: String {
         switch self {
-        case .ps5Pro: return "4K"
-        case .ps5: return "1440p"
-        case .xsx: return "1440p（菜单里没有就选 4K）"
+        case .ps5Pro, .ps5, .xsx: return "2160p"
         case .xss: return "1080p"
         }
     }
     var outputWhy: String {
         switch self {
-        case .ps5Pro: return "PSSR 重建出来的细节只有输出 4K 才拿得到"
-        case .ps5, .xsx: return "游戏内部就是 1440p，输出 4K 会先被主机放大、再被采集卡缩回来，多两次缩放"
+        case .ps5Pro: return "PSSR 重建出来的细节只有输出 2160p 才拿得到"
+        // 2026-11-24 改：原来推荐输出 1440p。游戏按输出分辨率做重建（动态分辨率最高到 4K），输出 2160p 细节最多；
+        // 采集卡缩到 1080p 正好 2 倍，画面最干净
+        case .ps5, .xsx: return "游戏按输出分辨率重建画面，输出 2160p 细节最多；采集 1080p 时正好缩小 2 倍，画面最干净"
         case .xss: return "内部只有 720p、放大到约 1080p，输出更高没有更多细节"
         }
     }
@@ -69,6 +69,13 @@ final class WizardModel: ObservableObject {
     @Published var captureFps = 60
     /// 当前采集卡支持的分辨率（打开时从主界面拿）
     var availableHeights: [Int] = [1080, 1440, 2160]
+    var heightMaxFps: [Int: Int] = [:]
+    /// 分辨率按钮上的字：没有这一档标"不支持"，跑不满所选帧率标最高帧率
+    func resLabel(_ h: Int) -> String {
+        if !availableHeights.contains(h) { return UIModel.resName(h) + "（不支持）" }
+        if let mx = heightMaxFps[h], mx < captureFps { return UIModel.resName(h) + "（\(mx) 帧）" }
+        return UIModel.resName(h)
+    }
     @Published var appliedSummary = ""      // 上次应用的配置（首页和设置里显示）
     var onApply: (Console) -> Void = { _ in }
     var onClose: () -> Void = {}
@@ -114,7 +121,7 @@ struct SetupWizardView: View {
                     HStack(alignment: .top, spacing: 16) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("采集分辨率").font(.system(size: 12, weight: .semibold))
-                            Segmented(labels: [1080, 1440, 2160].map { UIModel.resName($0) + (w.availableHeights.contains($0) ? "" : "（不支持）") },
+                            Segmented(labels: [1080, 1440, 2160].map { w.resLabel($0) },
                                       selection: [1080, 1440, 2160].firstIndex(of: w.captureHeight) ?? 0) { i in
                                 let h = [1080, 1440, 2160][i]
                                 if w.availableHeights.contains(h) { w.captureHeight = h }

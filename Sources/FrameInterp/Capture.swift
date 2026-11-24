@@ -176,16 +176,20 @@ enum Devices {
         return out
     }
 
-    /// 这台设备支持的 16:9 分辨率档（1080 / 1440 / 2160），只算能跑到 fps 的格式
-    static func supportedHeights(_ d: AVCaptureDevice, fps: Double = 60) -> [Int] {
-        if isScreenDevice(d) { return [1080] }
-        return [1080, 1440, 2160].filter { h in
-            d.formats.contains { f in
-                let dim = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-                return Int(dim.height) == h && Int(dim.width) == h * 16 / 9
-                    && f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= fps - 0.1 }
-            }
+    /// 这台设备有的 16:9 分辨率档（1080 / 1440 / 2160）和每档最高帧率。
+    /// 2026-11-24 改：以前只算能跑到 60 帧的档，有张"USB3 Video"卡 2K 只有 10/20/30 帧（不压缩 NV12），
+    /// 被标成"不支持"，而 OBS 能选。现在有就列出来，菜单里标最高帧率，让用户自己决定
+    static func heightMaxFps(_ d: AVCaptureDevice) -> [Int: Int] {
+        if isScreenDevice(d) { return [1080: 60] }
+        var out: [Int: Int] = [:]
+        for f in d.formats {
+            let dim = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let h = Int(dim.height)
+            guard [1080, 1440, 2160].contains(h), Int(dim.width) == h * 16 / 9 else { continue }
+            let mx = Int((f.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0).rounded())
+            if mx > 0 { out[h] = max(out[h] ?? 0, mx) }
         }
+        return out
     }
 
     /// 选 1080p、≥59.9fps，非 MJPEG 优先

@@ -15,6 +15,7 @@ FrameInterp 从 USB 采集卡（或串流 App 的窗口）取画面，去掉重�
 - **采集卡**：系统能当摄像头认出来的 USB 采集卡都能用（Genki ShadowCast、Elgato、AVerMedia、MS2109 方案的卡等），
   支持 1080p / 2K / 4K、60 / 120 帧；USB 带宽不够时自动退到能跑的档。
 - **串流窗口**：PS Remote Play、Moonlight、Chiaki 等串流 App 的窗口，按原始像素采集；串流窗口是系统全屏（单独一个桌面）也能用。
+- **模拟器窗口**：能认出 Dolphin、PCSX2、DuckStation、PPSSPP、RetroArch、RPCS3 等 Mac 模拟器，并列出每个模拟器要改的设置（后台输入、失去焦点暂停）。请用手柄操作，键盘鼠标会被 FrameInterp 收走。60 帧的游戏要 120Hz 屏幕才能补到 120。
 - **字幕和提示保护**：停住不动的字幕、HUD，在补出来的帧里用真实画面，不闪、不变形。
 - **清晰放大**：画面直接缩放到屏幕实际像素（放大用三次插值，4K 缩小按比例取样防闪烁），可选 RCAS 锐化。
 - **按主机一键配置**：选 PS5 / PS5 Pro / Xbox Series S / X，自动设好采集、补帧和锐化。
