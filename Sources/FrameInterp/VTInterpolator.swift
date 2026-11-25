@@ -255,6 +255,7 @@ final class VTInterpolator: @unchecked Sendable {
 
     /// 在当前线程同步补帧（只在 workQ 上调用）。phases：0~1 之间的位置，比如 [0.5] 或 [1/3, 2/3]
     private func runSync(prev: UniqueFrame, curr: UniqueFrame, phases: [Float]) -> ([CVPixelBuffer]?, Error?) {
+        if stopped { return (nil, NSError(domain: "interp", code: 4, userInfo: [NSLocalizedDescriptionKey: "补帧器已停止"])) }
         var dsts: [CVPixelBuffer] = []
         for _ in phases {
             guard let d = newBuffer(dstPool) else { return (nil, NSError(domain: "interp", code: 1, userInfo: [NSLocalizedDescriptionKey: "输出缓冲池用空"])) }
@@ -305,7 +306,11 @@ final class VTInterpolator: @unchecked Sendable {
     /// 在补帧串行队列上排一个任务（保证显示顺序）
     func enqueue(_ block: @escaping () -> Void) { workQ.async(execute: block) }
 
+    /// 2026-11-25 修：切换补帧分辨率（1080p 太慢自动降 720p）时，stop() 结束了会话，旧管线还在往 workQ 排补帧任务，
+    /// 在已结束的会话上 process 会崩（VTFrameProcessor captureTelemetryFromParametersIfNeeded 空指针）。
+    /// stopped 只在 workQ 上读写：停止后排进来的任务直接返回错误
+    private var stopped = false
     func stop() {
-        workQ.sync { processor.endSession() }
+        workQ.sync { stopped = true; processor.endSession() }
     }
 }

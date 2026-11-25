@@ -71,11 +71,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
     /// 27 才放宽到 1080p。用户反馈的两台（M2 26.6、M4 26.5.2）都是 26.x。所以 26.x 上一开始就用 720p 补帧，不用先等 10 秒失败
     /// 2026-11-23 B 站用户反馈：M1 Pro + macOS 27，1080p 补帧打开后只有 10 帧。Apple 论坛也有人实测 M1 Pro 低延迟补帧最大 720p，
     /// Console Link 等软件在 M1 Pro 上也只支持 720p。所以 M1 系列芯片一开始就用 720p 补帧；其他芯片补帧太慢时也会自动降到 720p（见 checkInterpSpeed）
-    var autoProc720 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27 || App.isM1Family
+    var autoProc720 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27 || App.isM1Family || SlowMemory.slow30
     /// 为什么用 720p 补帧（状态里说明）
     var proc720Reason: String {
         if ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27 { return "（macOS 26 只支持 720p 补帧，升级到 macOS 27 可用 1080p）" }
         if App.isM1Family && !slowSwitched { return "（M1 系列芯片 1080p 补帧太慢，自动用 720p）" }
+        if SlowMemory.slow30 && !slowSwitched { return "（上次测到这台 Mac 1080p 补帧太慢，直接用 720p）" }
         if slowSwitched { return "（1080p 补帧在这台 Mac 上太慢，自动改用 720p）" }
         return "（这台 Mac 上 1080p 补帧不可用，自动用 720p）"
     }
@@ -97,16 +98,21 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
         // 2026-11-24 加：120Hz 屏幕上 60 帧的游戏（模拟器、串流）要补到 120，每帧要在 16ms 内补完；
         // M2 上 1080p 补一帧约 18～20ms 跟不上，补完显示不到 1.6 倍就改用 720p
         let hiRefresh = (pipeline?.refreshMs ?? 16.7) < 10
-        let slow = ProcessInfo.processInfo.environment["FI_FAKE_SLOW"] == "1"
+        let slow30 = ProcessInfo.processInfo.environment["FI_FAKE_SLOW"] == "1"
             || (snap.interpDone > 0 && snap.interpAvg > 28)
             || (snap.unique <= 40 && snap.displayed < Int(Double(snap.unique) * 1.3))
-            || (hiRefresh && snap.unique >= 45 && snap.interpDone > 0 && snap.stillDirect == 0 && snap.displayed < Int(Double(snap.unique) * 1.6))
-        slowSeconds = slow ? slowSeconds + 1 : 0
-        guard slowSeconds >= 3, let cur = source else { return }
+        // 60 → 120：画面稳定 60 帧左右时，每帧平均超过 16.5ms 就一定跟不上（一秒要补 60 次）。
+        // 2026-11-25 改：不用等 3 秒，1 秒就降；上次在这台 Mac 上已经测到过，看到 60 帧画面马上降
+        let hiCase = hiRefresh && snap.unique >= 45 && snap.interpDone > 0 && snap.stillDirect == 0
+        let slowHi = hiCase && (SlowMemory.slowHi || snap.interpAvg > 16.5 || snap.displayed < Int(Double(snap.unique) * 1.6))
+        slowSeconds = slow30 || slowHi ? slowSeconds + 1 : 0
+        guard slowSeconds >= (slow30 ? 3 : 1), let cur = source else { return }
         slowSeconds = 0
         autoProc720 = true
         slowSwitched = true
-        Log.write("补帧太慢（每帧 \(f1(snap.interpAvg))ms，游戏 \(snap.unique) → 显示 \(snap.displayed)），自动改用 720p 补帧（\(App.machineInfo)）")
+        // 记下来：下次同一台 Mac、同一个系统版本直接用 720p（60 → 120 的情况只在看到 60 帧画面时才降，30 帧游戏照样用 1080p）
+        if slow30 { SlowMemory.slow30 = true } else { SlowMemory.slowHi = true }
+        Log.write("补帧太慢（每帧 \(f1(snap.interpAvg))ms，游戏 \(snap.unique) → 显示 \(snap.displayed)\(slow30 ? "" : "，屏幕高刷新率")），自动改用 720p 补帧并记住（\(App.machineInfo)）")
         view?.flash("1080p 补帧太慢，自动改用 720p 补帧…")
         Task { await switchTo(cur, force: true) }
     }
@@ -1067,7 +1073,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
                     self.model.interpStatus = "⚠ 补帧不可用（\(vt.width)×\(vt.height) 补帧在这台 Mac 上启动失败）\n\(App.machineInfo)\n"
                         + "画面照常显示，只是不补帧。请把 设置 → 状态 →「打开日志文件夹」里最新的日志发给作者\n\(e)"
                 } else {
-                    Log.write("补帧就绪：startSession \(Int(vt.startMs))ms，预热 \(Int(vt.warmupMs))ms")
+                    Log.write("补帧就绪：startSession \(Int(vt.startMs))ms，预热 \(Int(vt.warmupMs))ms" + (self.autoProc720 ? "，用 720p 补帧" + self.proc720Reason : ""))
                     self.view?.flash(self.autoProc720 ? "补帧就绪（这台 Mac 用 720p 补帧）" : "补帧就绪")
                     self.model.interpStatus = "Apple 低延迟补帧 · 已就绪" + (self.autoProc720 ? self.proc720Reason : "")
                 }
@@ -1412,3 +1418,30 @@ let app = NSApplication.shared
 let delegate = MainActor.assumeIsolated { App(options) }
 app.delegate = delegate
 app.run()
+
+
+/// 记住"这台 Mac 上 1080p 补帧太慢"（2026-11-25 加）。按芯片 + 型号 + 系统版本记，换了系统版本就重新测。
+/// slow30：普通补帧（30 → 60）就跟不上 → 下次一开始就用 720p；
+/// slowHi：只是高刷新率屏幕上 60 → 120 跟不上 → 下次看到 60 帧画面马上降，30 帧游戏还是 1080p
+@MainActor
+enum SlowMemory {
+    static let key = "slow1080.v1"
+    private static var dict: [String: Any] {
+        guard let d = UserDefaults.standard.dictionary(forKey: key), d["machine"] as? String == App.machineInfo else { return [:] }
+        return d
+    }
+    private static func set(_ k: String) {
+        var d = dict
+        d["machine"] = App.machineInfo
+        d[k] = true
+        UserDefaults.standard.set(d, forKey: key)
+    }
+    static var slow30: Bool {
+        get { dict["slow30"] as? Bool ?? false }
+        set { if newValue { set("slow30") } }
+    }
+    static var slowHi: Bool {
+        get { dict["slowHi"] as? Bool ?? false }
+        set { if newValue { set("slowHi") } }
+    }
+}

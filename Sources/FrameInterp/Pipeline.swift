@@ -16,6 +16,7 @@ struct StatsSnapshot {
     var copyMs = 0.0, obsMs = 0.0, waitMs = 0.0
     var capDelay = 0.0, capDelayMax = 0.0
     var stillDirect = 0
+    var gpuGuard = 0      // 720p 补帧时在显卡上合成字幕保护的帧数
     var dupMean = 0.0, dupMeanMax = 0.0, dupPctMax = 0.0, uniqMean = 0.0, latency = 0.0
     var interpOn = false
     var backend = ""
@@ -23,7 +24,7 @@ struct StatsSnapshot {
 
     var line: String {
         var s = "采集 \(capture)（系统丢 \(avfDrops)，采集到程序 \(f1(capDelay))/\(f1(capDelayMax))ms） | 唯一 \(unique) | 显示 \(displayed) | 补帧[\(interpOn ? backend : "关")] \(interpDone) 平均 \(f1(interpAvg))ms 最大 \(f1(interpMax))ms"
-            + " | 拷贝小图 \(f1(copyMs)) 拷原图 \(f1(obsMs)) 排队 \(f1(waitMs))ms | 格式变化 \(fmtChanges)(\(lastFmt)) | 失败 \(failures) | 削积压 \(trims) | 静止直通 \(stillDirect) | 补2帧 \(doubleInterp) | 无需补 \(noNeed) | 太慢跳过 \(lateSkips) | 切场景 \(cuts) | 队列丢 \(drops) 空拍 \(empty) 深度 \(depth)"
+            + " | 拷贝小图 \(f1(copyMs)) 拷原图 \(f1(obsMs)) 排队 \(f1(waitMs))ms | 格式变化 \(fmtChanges)(\(lastFmt)) | 失败 \(failures) | 削积压 \(trims) | 静止直通 \(stillDirect)\(gpuGuard > 0 ? " 显卡字幕 \(gpuGuard)" : "") | 补2帧 \(doubleInterp) | 无需补 \(noNeed) | 太慢跳过 \(lateSkips) | 切场景 \(cuts) | 队列丢 \(drops) 空拍 \(empty) 深度 \(depth)"
             + " | 差值 重复 \(f2(dupMean))(最大 \(f2(dupMeanMax))/\(String(format: "%.3f", dupPctMax))%) 唯一 \(f1(uniqMean)) 阈值 \(f2(dupThr))/\(String(format: "%.3f", dupPct))% | 增强 \(f1(enhanceAvg))/\(f1(enhanceMax))ms | 延迟 \(f1(latency))ms"
         if let error { s += "\n  最近错误：\(error)" }
         return s
@@ -48,6 +49,7 @@ final class Stats {
     var copyMsSum = 0.0, obsMsSum = 0.0, prepN = 0, waitMsSum = 0.0, waitN = 0
     var capDelaySum = 0.0, capDelayN = 0, capDelayMax = 0.0
     var stillDirect = 0
+    var gpuGuard = 0      // 720p 补帧时在显卡上合成字幕保护的帧数
     var dupDiffSum = 0.0, dupN = 0, uniqDiffSum = 0.0, uniqN = 0
     var dupPctMax = 0.0, dupMeanMax = 0.0
     var latencySum = 0.0, latencyN = 0
@@ -80,6 +82,7 @@ final class Stats {
         r.capDelay = capDelayN > 0 ? capDelaySum / Double(capDelayN) : 0; r.capDelayMax = capDelayMax
         capDelaySum = 0; capDelayN = 0; capDelayMax = 0
         r.stillDirect = stillDirect; stillDirect = 0
+        r.gpuGuard = gpuGuard; gpuGuard = 0
         r.lateSkips = lateSkips; r.noNeed = noNeed; r.doubleInterp = doubleInterp; r.dupThr = dupThr; r.dupPct = dupPct
         r.failures = failures; r.cuts = cuts; r.drops = queueDrops; r.empty = emptyVsync; r.depth = queueDepth
         r.dupMean = dupN > 0 ? dupDiffSum / Double(dupN) : 0
@@ -314,8 +317,23 @@ final class Pipeline {
                         $0.allInterpMs.append(ms)
                         if outs.count > 1 { $0.doubleInterp += 1 }
                     }
+                    // 2026-11-25：清晰放大开着时，720p 补出来的帧直接交给它一次放大到屏幕大小（输出尺寸和真实帧一样，不会闪），
+                    // 不再先用系统转换拉到 1080p 再放大一次——少一次插值，补出来的帧没那么软。
+                    // 字幕保护也改在显卡上做：把要保护的位置图和真实帧一起交给清晰放大，放大时那些像素用真实帧放大的结果，
+                    // 和真实帧显示的一模一样（以前要先拉到 1080p 才能在 CPU 上逐像素替换）
+                    let direct = scaler?.enabled == true
                     for o in outs {
-                        // 补出来的帧如果是补帧分辨率（720p），先放大回原分辨率再显示：
+                        let small = CVPixelBufferGetHeight(o) != CVPixelBufferGetHeight(real)
+                        if direct && small {
+                            let mask = makeMask(real)
+                            if !loggedDirect {
+                                loggedDirect = true
+                                Log.write("补出来的帧 \(CVPixelBufferGetWidth(o))x\(CVPixelBufferGetHeight(o)) 直接放大到屏幕（不先拉到 \(CVPixelBufferGetWidth(real))x\(CVPixelBufferGetHeight(real))；字幕保护在显卡上合成）")
+                            }
+                            emit(o, interpolated: true, arrivalMs: t, overlay: mask.map { (real, $0) })
+                            continue
+                        }
+                        // 补出来的帧如果是补帧分辨率（720p）、又没开清晰放大，先放大回原分辨率再显示：
                         // 尺寸和真实帧一样，显示层不会每帧切换尺寸（那样会闪）
                         let up = interp.upscaleToDisp(o)
                         // 字幕保护：字幕区里不动的文字换回真实帧（不然补出来的帧里字幕被拖变形，看起来在闪）
@@ -361,6 +379,8 @@ final class Pipeline {
 
     /// 清晰放大（Lanczos 缩放到屏幕大小 + 锐化）；开着时代替旧的画面增强
     var scaler: SharpScaler?
+    private var loggedDirect = false
+    private var loggedCompose = false
 
     /// 画面增强（放大 + 锐化）；nil = 不处理
     var enhancer: Enhancer?
@@ -368,18 +388,46 @@ final class Pipeline {
     /// 送去显示：先过画面增强，再进显示队列。在单独的串行队列上做，不占采集线程
     /// （采集线程一忙，系统就会把新来的帧直接丢掉）。所有帧按调用顺序进这个队列，显示顺序不变。
     private let outputQ = DispatchQueue(label: "pipeline.output", qos: .userInteractive)
-    private func emit(_ buffer: CVPixelBuffer, interpolated: Bool, arrivalMs: Double) {
-        outputQ.async { [self] in emitNow(buffer, interpolated: interpolated, arrivalMs: arrivalMs) }
+    private func emit(_ buffer: CVPixelBuffer, interpolated: Bool, arrivalMs: Double, overlay: (CVPixelBuffer, CVPixelBuffer)? = nil) {
+        outputQ.async { [self] in emitNow(buffer, interpolated: interpolated, arrivalMs: arrivalMs, overlay: overlay) }
+    }
+
+    /// 字幕保护的位置图（和真实帧一样大的单通道图，255 = 用真实帧）。没有要保护的字返回 nil
+    private var maskPool: CVPixelBufferPool?
+    private var maskPoolSize = (0, 0)
+    private func makeMask(_ real: CVPixelBuffer) -> CVPixelBuffer? {
+        guard textGuards.contains(where: { $0.active }) else { return nil }
+        let w = CVPixelBufferGetWidth(real), h = CVPixelBufferGetHeight(real)
+        if maskPool == nil || maskPoolSize != (w, h) {
+            let attrs: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_OneComponent8,
+                                        kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
+                                        kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+                                        kCVPixelBufferMetalCompatibilityKey as String: true]
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &maskPool)
+            maskPoolSize = (w, h)
+        }
+        var pb: CVPixelBuffer?
+        guard let maskPool, CVPixelBufferPoolCreatePixelBuffer(nil, maskPool, &pb) == kCVReturnSuccess, let pb else { return nil }
+        CVPixelBufferLockBaseAddress(pb, [])
+        if let b = CVPixelBufferGetBaseAddress(pb) { memset(b, 0, CVPixelBufferGetBytesPerRow(pb) * h) }
+        CVPixelBufferUnlockBaseAddress(pb, [])
+        var any = false
+        for g in textGuards where g.writeMask(into: pb) { any = true }
+        return any ? pb : nil
     }
     /// 补出来的帧直接上屏的出口（显示视图设置）。返回 false 表示没上屏，照常进队列
     var directInterp: ((CVPixelBuffer, Double) -> Bool)?
 
-    private func emitNow(_ buffer: CVPixelBuffer, interpolated: Bool, arrivalMs: Double) {
+    private func emitNow(_ buffer: CVPixelBuffer, interpolated: Bool, arrivalMs: Double, overlay: (CVPixelBuffer, CVPixelBuffer)? = nil) {
         var out = buffer
         defer { _ = out }
         // 清晰放大：缩放到屏幕大小 + 锐化，所有帧一样处理（代替下面旧的锐化）
         if let s = scaler, s.enabled {
-            out = s.process(buffer)
+            out = s.process(buffer, interpolated: interpolated, overlay: overlay)
+            if overlay != nil {
+                stats.with { $0.gpuGuard += 1 }
+                if s.composed && !loggedCompose { loggedCompose = true; Log.write("字幕保护：在显卡放大时合成（720p 补帧）") }
+            }
             stats.with { $0.enhanceMsSum += s.lastMs; $0.enhanceN += 1; $0.enhanceMsMax = max($0.enhanceMsMax, s.lastMs) }
             if interpolated, queue.count == 0, let d = directInterp, d(out, arrivalMs) { return }
             queue.push(.init(buffer: out, interpolated: interpolated, arrivalMs: arrivalMs))

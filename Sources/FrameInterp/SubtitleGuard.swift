@@ -51,6 +51,28 @@ final class SubtitleGuard: @unchecked Sendable {
     private var hasPrev = false
 
     func reset() { lock.lock(); hasPrev = false; maskCount = 0; lock.unlock() }
+    /// 这一帧有没有要换回真实帧的字（有的话补出来的帧要和真实帧一样大才能合成）
+    var active: Bool { lock.lock(); defer { lock.unlock() }; return enabled && maskCount > 0 }
+
+    /// 把要保护的像素写进一张单通道位置图（和真实帧一样大，255 = 用真实帧）。给显卡放大时合成用（720p 补帧）。
+    /// 写了返回 true
+    @discardableResult func writeMask(into pb: CVPixelBuffer) -> Bool {
+        guard enabled else { return false }
+        lock.lock(); defer { lock.unlock() }
+        guard maskCount > 0, CVPixelBufferGetWidth(pb) == w, CVPixelBufferGetHeight(pb) == h else { return false }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return false }
+        let bpr = CVPixelBufferGetBytesPerRow(pb)
+        let rw = rw, rh = rh, rx = rx, ry = ry
+        mask.withUnsafeBufferPointer { m in
+            for y in 0..<rh {
+                let row = base.advanced(by: (ry + y) * bpr + rx)
+                for x in 0..<rw where m[y * rw + x] == 1 { row[x] = 255 }
+            }
+        }
+        return true
+    }
 
     private func setup(_ width: Int, _ height: Int) {
         guard width != w || height != h else { return }

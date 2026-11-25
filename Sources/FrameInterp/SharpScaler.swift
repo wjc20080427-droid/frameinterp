@@ -30,6 +30,8 @@ final class SharpScaler: @unchecked Sendable {
         didSet { if targetSize != oldValue { lock.lock(); targetChangedAt = nowMs(); lock.unlock() } }
     }
     private var targetChangedAt = 0.0
+    private var sourceHeightSeen = 0    // 最近一帧真实帧的高度
+    private var lastRealOut = (0, 0)    // 最近一帧真实帧输出的尺寸
     private var stable = CGSize.zero
     private(set) var lastMs = 0.0
     private(set) var describe = ""
@@ -39,13 +41,17 @@ final class SharpScaler: @unchecked Sendable {
     private let queue: MTLCommandQueue
     private let yPS: MTLComputePipelineState, cPS: MTLComputePipelineState
     private let rcasPS: MTLComputePipelineState
+    private let bYPS: MTLComputePipelineState, bCPS: MTLComputePipelineState
+    private let nearest: MTLSamplerState
     private let dH1: MTLComputePipelineState, dV1: MTLComputePipelineState, dH2: MTLComputePipelineState, dV2: MTLComputePipelineState
     private let sampler: MTLSamplerState
     private(set) var lastGpuMs = 0.0
     private var cache: CVMetalTextureCache?
     private var pool: CVPixelBufferPool?
     private var poolSize = (0, 0)
-    private var tmpY2: MTLTexture?, tmpH: MTLTexture?, tmpHC: MTLTexture?
+    private var tmpY2: MTLTexture?
+    /// 缩小用的中间纹理，按"输出宽 × 源高"分开存：720p 补帧时真实帧（1080p）和补出来的帧（720p）交替进来，不能每帧重建
+    private var tmpHs: [String: MTLTexture] = [:], tmpHCs: [String: MTLTexture] = [:]
     /// 缩小用的采样表（每个输出坐标 5 组：采样位置 + 权重），尺寸变了才重算。
     /// 相邻两个同号权重的像素合成一次双线性采样（GPU 一次读两个像素），读取次数减半
     private var lut: [String: MTLBuffer] = [:]
@@ -102,6 +108,7 @@ final class SharpScaler: @unchecked Sendable {
             let lib = try d.makeLibrary(source: SharpScaler.shader, options: nil)
             func p(_ n: String) throws -> MTLComputePipelineState { try d.makeComputePipelineState(function: lib.makeFunction(name: n)!) }
             yPS = try p("cubicY"); cPS = try p("cubicC"); rcasPS = try p("rcasY")
+            bYPS = try p("blendY"); bCPS = try p("blendC")
             dH1 = try p("downH1"); dV1 = try p("downV1"); dH2 = try p("downH2"); dV2 = try p("downV2")
         } catch {
             Log.write("⚠ 清晰放大着色器编译失败：\(error)")
@@ -112,6 +119,11 @@ final class SharpScaler: @unchecked Sendable {
         sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
         sd.normalizedCoordinates = true
         sampler = d.makeSamplerState(descriptor: sd)!
+        let nd = MTLSamplerDescriptor()
+        nd.minFilter = .nearest; nd.magFilter = .nearest
+        nd.sAddressMode = .clampToEdge; nd.tAddressMode = .clampToEdge
+        nd.normalizedCoordinates = true
+        nearest = d.makeSamplerState(descriptor: nd)!
         CVMetalTextureCacheCreate(nil, nil, d, nil, &cache)
         VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer)
     }
@@ -124,7 +136,9 @@ final class SharpScaler: @unchecked Sendable {
     }
 
     /// 处理一帧：缩放到显示大小（+ 锐化）。不需要处理 / 出错时原样返回
-    func process(_ src: CVPixelBuffer) -> CVPixelBuffer {
+    /// interpolated：补出来的帧（720p 补帧时尺寸比真实帧小）。设置里显示的"当前：…"只按真实帧更新，不然两种尺寸来回跳
+    /// overlay：(真实帧, 字幕保护位置图)。720p 补帧时字幕保护在这里合成：位置图里标了的像素用真实帧放大的结果
+    func process(_ src: CVPixelBuffer, interpolated: Bool = false, overlay: (CVPixelBuffer, CVPixelBuffer)? = nil) -> CVPixelBuffer {
         guard enabled else { return src }
         lock.lock(); defer { lock.unlock() }
         guard let cache else { return src }
@@ -134,61 +148,53 @@ final class SharpScaler: @unchecked Sendable {
         let ow = Int(stable.width) & ~1, oh = Int(stable.height) & ~1
         let isCompressed = compressed
         let sharp = sharpFor(sh) * (isCompressed ? compressedSharpFactor : 1)
-        let scale = abs(ow - sw) > 8 || abs(oh - sh) > 8
-        guard scale || sharp > 0 else { return src }
+        // 720p 补出来的帧：放大到真实帧最后输出的尺寸（哪怕真实帧没缩放），两种帧尺寸始终一样，显示层不会闪
+        let matchReal = interpolated && sh != sourceHeightSeen && lastRealOut.0 > 0
+        let scale = matchReal || abs(ow - sw) > 8 || abs(oh - sh) > 8
+        guard scale || sharp > 0 else { if !interpolated { lastRealOut = (sw, sh); sourceHeightSeen = sh }; return src }
         let t0 = nowMs()
+        composed = false
         // 采集卡的 4:2:2（yuvs）先转成 420v（和补帧的帧同一种格式）
         var input = src
         if CVPixelBufferGetPixelFormatType(src) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
             guard let conv = convert(src, sw, sh) else { return src }
             input = conv
         }
-        let (dw, dh) = scale ? (ow, oh) : (sw, sh)
+        let (dw, dh) = matchReal ? lastRealOut : scale ? (ow, oh) : (sw, sh)
         guard let out = outBuffer(dw, dh),
               let iY = tex(input, 0, .r8Unorm, cache), let iC = tex(input, 1, .rg8Unorm, cache),
               let oY = tex(out, 0, .r8Unorm, cache), let oC = tex(out, 1, .rg8Unorm, cache),
               let cb = queue.makeCommandBuffer() else { return src }
         // 只缩一点（如 2K 放进 2404 宽的窗口，0.94 倍）几乎不闪，不值得多花时间；缩到 0.85 倍以下才用
         let down = scale && wideDown && dw < sw * 85 / 100 && dh < sh * 85 / 100
-        ensureTemps(sw, sh, dw, dh)
-        guard let tmpY2 else { return src }
-        if let e = cb.makeComputeCommandEncoder() {
-            e.setSamplerState(sampler, index: 0)
-            let lumaIn: MTLTexture = iY
-            // 亮度：一遍缩放（锐化时先写临时纹理，再 RCAS 写到输出）
-            let wx = down ? weights(sw, dw) : nil, wy = down ? weights(sh, dh) : nil
-            let wcx = down ? weights(sw / 2, dw / 2) : nil, wcy = down ? weights(sh / 2, dh / 2) : nil
-            if down, let tmpH, let wx, let wy {
-                e.setComputePipelineState(dH1); e.setTextures([lumaIn, tmpH], range: 0..<2); e.setBuffer(wx, offset: 0, index: 0)
-                dispatch(e, dH1, dw, sh)
-                e.setComputePipelineState(dV1); e.setTextures([tmpH, sharp > 0 ? tmpY2 : oY], range: 0..<2); e.setBuffer(wy, offset: 0, index: 0)
-                dispatch(e, dV1, dw, dh)
-            } else {
-                e.setComputePipelineState(yPS); e.setTextures([lumaIn, sharp > 0 ? tmpY2 : oY], range: 0..<2)
-                dispatch(e, yPS, dw, dh)
-            }
-            if sharp > 0 {
-                var con: Float = exp2(-(1 - sharp) * 2)
-                e.setComputePipelineState(rcasPS); e.setTextures([tmpY2, oY], range: 0..<2); e.setBytes(&con, length: 4, index: 0)
-                dispatch(e, rcasPS, dw, dh)
-            }
-            // 色度（半分辨率）
-            if down, let tmpHC, let wcx, let wcy {
-                e.setComputePipelineState(dH2); e.setTextures([iC, tmpHC], range: 0..<2); e.setBuffer(wcx, offset: 0, index: 0)
-                dispatch(e, dH2, dw / 2, sh / 2)
-                e.setComputePipelineState(dV2); e.setTextures([tmpHC, oC], range: 0..<2); e.setBuffer(wcy, offset: 0, index: 0)
-                dispatch(e, dV2, dw / 2, dh / 2)
-            } else {
-                e.setComputePipelineState(cPS); e.setTextures([iC, oC], range: 0..<2)
-                dispatch(e, cPS, dw / 2, dh / 2)
-            }
-            e.endEncoding()
+        guard let e = cb.makeComputeCommandEncoder() else { return src }
+        e.setSamplerState(sampler, index: 0)
+        e.setSamplerState(nearest, index: 1)
+        guard encodeScale(e, iY: iY, iC: iC, oY: oY, oC: oC, sw: sw, sh: sh, dw: dw, dh: dh, sharp: sharp, down: down) else {
+            e.endEncoding(); return src
         }
+        // 字幕保护（720p 补帧）：真实帧按它自己显示时完全一样的方式放大到同样大小，位置图里标了的像素换成真实帧的
+        if let (real, mask) = overlay, CVPixelBufferGetPixelFormatType(real) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+           let rY = tex(real, 0, .r8Unorm, cache), let rC = tex(real, 1, .rg8Unorm, cache), let mT = tex(mask, 0, .r8Unorm, cache) {
+            let rw = CVPixelBufferGetWidth(real), rh = CVPixelBufferGetHeight(real)
+            let rsharp = sharpFor(rh) * (isCompressed ? compressedSharpFactor : 1)
+            let rdown = wideDown && dw < rw * 85 / 100 && dh < rh * 85 / 100
+            ensureOverlay(dw, dh)
+            if let ovY, let ovC,
+               encodeScale(e, iY: rY, iC: rC, oY: ovY, oC: ovC, sw: rw, sh: rh, dw: dw, dh: dh, sharp: rsharp, down: rdown) {
+                e.setComputePipelineState(bYPS); e.setTextures([ovY, mT, oY], range: 0..<3); dispatch(e, bYPS, dw, dh)
+                e.setComputePipelineState(bCPS); e.setTextures([ovC, mT, oC], range: 0..<3); dispatch(e, bCPS, dw / 2, dh / 2)
+                composed = true
+            }
+        }
+        e.endEncoding()
         cb.commit(); cb.waitUntilCompleted()
         lastGpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
         guard cb.status == .completed else { return src }
         tagBT709(out)
         lastMs = nowMs() - t0
+        if interpolated && sh != sourceHeightSeen { return out }
+        if !interpolated { sourceHeightSeen = sh; lastRealOut = (dw, dh) }
         let ratio = Double(dw) / Double(sw)
         let how = !scale ? "不缩放" : ratio > 1 ? String(format: "放大 %.2f 倍 · 三次插值", ratio)
             : String(format: "缩小到 %.2f 倍 · ", ratio) + (down ? "按比例取样（防闪烁）" : "三次插值")
@@ -200,6 +206,53 @@ final class SharpScaler: @unchecked Sendable {
         return out
     }
 
+    /// 一帧的缩放（+ 锐化）编进 encoder：亮度一遍缩放（锐化时先写临时纹理，再 RCAS 写到输出），色度半分辨率
+    private func encodeScale(_ e: MTLComputeCommandEncoder, iY: MTLTexture, iC: MTLTexture, oY: MTLTexture, oC: MTLTexture,
+                             sw: Int, sh: Int, dw: Int, dh: Int, sharp: Float, down: Bool) -> Bool {
+        ensureTemps(sw, sh, dw, dh, down: down)
+        guard let tmpY2 else { return false }
+        let tmpH = down ? tmpHs["\(dw)x\(sh)"] : nil, tmpHC = down ? tmpHCs["\(dw)x\(sh)"] : nil
+        let wx = down ? weights(sw, dw) : nil, wy = down ? weights(sh, dh) : nil
+        let wcx = down ? weights(sw / 2, dw / 2) : nil, wcy = down ? weights(sh / 2, dh / 2) : nil
+        if down, let tmpH, let wx, let wy {
+            e.setComputePipelineState(dH1); e.setTextures([iY, tmpH], range: 0..<2); e.setBuffer(wx, offset: 0, index: 0)
+            dispatch(e, dH1, dw, sh)
+            e.setComputePipelineState(dV1); e.setTextures([tmpH, sharp > 0 ? tmpY2 : oY], range: 0..<2); e.setBuffer(wy, offset: 0, index: 0)
+            dispatch(e, dV1, dw, dh)
+        } else {
+            e.setComputePipelineState(yPS); e.setTextures([iY, sharp > 0 ? tmpY2 : oY], range: 0..<2)
+            dispatch(e, yPS, dw, dh)
+        }
+        if sharp > 0 {
+            var con: Float = exp2(-(1 - sharp) * 2)
+            e.setComputePipelineState(rcasPS); e.setTextures([tmpY2, oY], range: 0..<2); e.setBytes(&con, length: 4, index: 0)
+            dispatch(e, rcasPS, dw, dh)
+        }
+        if down, let tmpHC, let wcx, let wcy {
+            e.setComputePipelineState(dH2); e.setTextures([iC, tmpHC], range: 0..<2); e.setBuffer(wcx, offset: 0, index: 0)
+            dispatch(e, dH2, dw / 2, sh / 2)
+            e.setComputePipelineState(dV2); e.setTextures([tmpHC, oC], range: 0..<2); e.setBuffer(wcy, offset: 0, index: 0)
+            dispatch(e, dV2, dw / 2, dh / 2)
+        } else {
+            e.setComputePipelineState(cPS); e.setTextures([iC, oC], range: 0..<2)
+            dispatch(e, cPS, dw / 2, dh / 2)
+        }
+        return true
+    }
+
+    /// 字幕保护用：真实帧放大后的亮度 / 色度（和输出一样大）
+    private var ovY: MTLTexture?, ovC: MTLTexture?
+    private func ensureOverlay(_ dw: Int, _ dh: Int) {
+        func make(_ f: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+            return device.makeTexture(descriptor: d)
+        }
+        if ovY?.width != dw || ovY?.height != dh { ovY = make(.r8Unorm, dw, dh); ovC = make(.rg8Unorm, dw / 2, dh / 2) }
+    }
+    /// 最近一帧有没有在显卡上合成字幕（统计用）
+    private(set) var composed = false
+
     private func convert(_ src: CVPixelBuffer, _ w: Int, _ h: Int) -> CVPixelBuffer? {
         if inPool == nil || inPoolSize != (w, h) {
             inPool = makePool(w, h); inPoolSize = (w, h)
@@ -210,15 +263,19 @@ final class SharpScaler: @unchecked Sendable {
         return pb
     }
 
-    private func ensureTemps(_ sw: Int, _ sh: Int, _ dw: Int, _ dh: Int) {
+    private func ensureTemps(_ sw: Int, _ sh: Int, _ dw: Int, _ dh: Int, down: Bool) {
         func make(_ f: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
             return device.makeTexture(descriptor: d)
         }
         if tmpY2?.width != dw || tmpY2?.height != dh { tmpY2 = make(.r16Float, dw, dh) }
-        if tmpH?.width != dw || tmpH?.height != sh { tmpH = make(.r16Float, dw, sh) }
-        if tmpHC?.width != dw / 2 || tmpHC?.height != sh / 2 { tmpHC = make(.rg16Float, dw / 2, sh / 2) }
+        guard down else { return }
+        let key = "\(dw)x\(sh)"
+        if tmpHs[key] == nil {
+            if tmpHs.count > 4 { tmpHs.removeAll(); tmpHCs.removeAll() } // 窗口大小变过几次：旧的扔掉
+            tmpHs[key] = make(.r16Float, dw, sh); tmpHCs[key] = make(.rg16Float, dw / 2, sh / 2)
+        }
     }
 
     private func makePool(_ w: Int, _ h: Int) -> CVPixelBufferPool? {
@@ -323,6 +380,24 @@ final class SharpScaler: @unchecked Sendable {
                        device const float2 *wt [[buffer(0)]], sampler s [[sampler(0)]], uint2 g [[thread_position_in_grid]]) {
         if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;
         dst.write(float4(saturate(downAt(src, s, g, wt, false)), 0, 1), g);
+    }
+
+    // 字幕保护合成：位置图（真实帧大小，最近邻取样）里标了的像素，换成真实帧放大后的结果
+    kernel void blendY(texture2d<float, access::read> ov [[texture(0)]], texture2d<float, access::sample> mask [[texture(1)]],
+                       texture2d<float, access::write> dst [[texture(2)]], sampler ns [[sampler(1)]], uint2 g [[thread_position_in_grid]]) {
+        if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;
+        float2 uv = (float2(g) + 0.5) / float2(dst.get_width(), dst.get_height());
+        if (mask.sample(ns, uv).r > 0.5) dst.write(ov.read(g), g);
+    }
+    kernel void blendC(texture2d<float, access::read> ov [[texture(0)]], texture2d<float, access::sample> mask [[texture(1)]],
+                       texture2d<float, access::write> dst [[texture(2)]], sampler ns [[sampler(1)]], uint2 g [[thread_position_in_grid]]) {
+        if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;
+        // 色度一个像素对应亮度 2×2：四个里有一个要保护就换（和 CPU 版一样）
+        float2 c = (float2(g) + 0.5) / float2(dst.get_width(), dst.get_height());
+        float2 o = 0.25 / float2(dst.get_width(), dst.get_height());
+        float m = max(max(mask.sample(ns, c + float2(-o.x, -o.y)).r, mask.sample(ns, c + float2(o.x, -o.y)).r),
+                      max(mask.sample(ns, c + float2(-o.x, o.y)).r, mask.sample(ns, c + float2(o.x, o.y)).r));
+        if (m > 0.5) dst.write(ov.read(g), g);
     }
 
     // RCAS 只做亮度（AMD FidelityFX，FSR 1 的锐化部分）
