@@ -14,6 +14,7 @@ struct SourceOption: Identifiable, Hashable {
     var unsupported = false  // 窗口：暂不支持（浏览器里的 Xbox 网页串流）
     var emulator = ""        // 窗口：是哪个模拟器的（Emulator.name），空 = 不是模拟器
     var size = ""            // 窗口：大小（点）
+    var platform = -1        // 窗口：串流平台（WindowCapture.platform：0 Xbox / 1 PlayStation / 3 其他）
 
     static func == (a: SourceOption, b: SourceOption) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
@@ -26,6 +27,7 @@ extension Source {
         case .window(let id, _): return "win:\(id)"
         case .iphone: return "iphone"
         case .test: return "test"
+        case .xbox(let id, _): return "xbox:\(id)"
         }
     }
 }
@@ -64,7 +66,11 @@ final class UIModel: ObservableObject {
     @Published var inputMode = 0             // 设置里的输入类型：0 采集卡 / 1 串流窗口
     @Published var screenAccess = false      // 有没有录屏权限（读窗口画面要它）
     @Published var showWindowPicker = false
-    @Published var windowKind = 0            // 首页窗口卡片 / 窗口选择器的分页：0 串流 / 1 模拟器
+    @Published var windowKind = 0            // 窗口选择器的分页：0 串流 / 1 模拟器
+    /// 首页「串流」板块选的是哪个：0 Xbox / 1 PlayStation / 2 模拟器（记住上次选的）
+    @Published var streamTab = UserDefaults.standard.integer(forKey: "streamTab.v1") {
+        didSet { UserDefaults.standard.set(streamTab, forKey: "streamTab.v1") }
+    }
     @Published var showEmulatorList = false  // 支持的模拟器列表
     @Published var showWizard = false       // 配置向导
     var onOpenWizard: () -> Void = {}
@@ -72,6 +78,19 @@ final class UIModel: ObservableObject {
     @Published var windowThumbs: [String: NSImage] = [:]
     var windowOptions: [SourceOption] { sources.filter { $0.group == .window } }
     var onOpenWindowPicker: () -> Void = {}
+    var onWebXbox: () -> Void = {}
+    var onWebStart: () -> Void = {}
+    var onWebClose: () -> Void = {}
+    /// 内嵌 Xbox 网页：webMode = 网页正显示在画面区（用户在操作网页）；webLoaded = 网页开着（补帧时网页在后面的采集窗口里）
+    @Published var webMode = false
+    @Published var webLoaded = false
+    /// 原生 Xbox 串流连接中：画面区盖加载动画（nil = 不盖）。title = 主机名，step = 当前步骤
+    @Published var nativeConnecting: (title: String, step: String)? = nil
+    @Published var webLoading = false       // 网页正在加载（画面区盖加载动画）
+    @Published var webProgress = 0.0
+    @Published var webError: String?        // 加载失败的原因（显示「重试」）
+    var onWebReload: () -> Void = {}
+    var webSlot: NSView?
     var onRequestScreenAccess: () -> Void = {}
     var onRelaunch: () -> Void = {}
     var onWindowAutoCrop: (Bool) -> Void = { _ in }
@@ -304,7 +323,18 @@ struct TopBar: View {
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.muted)
                     .lineLimit(1)
             }
-            StartButton(model: model)
+            if model.webMode {
+                // 内嵌 Xbox 网页：在网页里开始串流后点「开始补帧」
+                Text("Xbox 网页 · 串流开始后点「开始补帧」").font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.muted).lineLimit(1)
+                PillButton(title: "关闭网页", icon: "xmark", filled: false) { model.onWebClose() }
+                PillButton(title: "开始补帧", icon: "play.fill", filled: true) { model.onWebStart() }
+            } else {
+                if model.webLoaded {
+                    PillButton(title: "回到网页", icon: "globe", filled: false) { model.onWebXbox() }
+                        .help("⌘J")
+                }
+                StartButton(model: model)
+            }
         }
         .padding(.horizontal, 16)
         .frame(height: Theme.topBarH)
@@ -348,7 +378,12 @@ struct StatusPill: View {
 
     private var state: (String, Color) {
         let s = model.snap
-        if model.opening { return ("连接中", Theme.amber) }
+        // 采集卡和串流共用这一个状态（不会同时用）。内嵌 Xbox 网页显示在画面区时：加载中 → 连接中，加载完 → 已连接，失败 → 出错
+        if model.webMode {
+            if model.webError != nil { return ("出错", Theme.amber) }
+            return model.webLoading ? ("连接中", Theme.amber) : ("已连接 · Xbox", Theme.ok)
+        }
+        if model.opening || model.nativeConnecting != nil { return ("连接中", Theme.amber) }
         guard model.hasInput else { return (model.message != nil ? "出错" : "未连接", model.message != nil ? Theme.amber : Theme.faint) }
         let res = model.sourceH > 0 ? UIModel.resName(model.sourceH) : ""
         if model.interpOn && s.interpOn && s.displayed > 0 { return ("补帧 · \(res) · \(s.unique) → \(s.displayed)", Theme.ok) }
@@ -381,6 +416,104 @@ struct StartButton: View {
 
 // MARK: - 画面区域
 
+/// 内嵌网页加载中 / 加载失败：盖在网页上面（网页没画出来前是一片灰，用户会以为打不开）。
+/// 2026-11-27 用户要求：不写网址，写「正在加载 Xbox 远程游玩」；动画参考 Xbox 手机 App 进入时的感觉——
+/// 深色底上一团绿光在呼吸、外圈弧线在转。不画 Xbox 标志（微软商标），只用绿色和光感
+struct WebLoadingView: View {
+    @ObservedObject var model: UIModel
+    var body: some View {
+        ZStack {
+            // 深色底 + 中间一点很淡的绿光
+            Theme.bg
+            RadialGradient(colors: [XboxGlow.green.opacity(0.16), .clear], center: .center, startRadius: 0, endRadius: 420)
+            VStack(spacing: 16) {
+                if let e = model.webError {
+                    Image(systemName: "wifi.exclamationmark").font(.system(size: 30, weight: .semibold)).foregroundStyle(Theme.amber)
+                    Text(model.webLoading ? "Xbox 远程游玩还没打开" : "Xbox 远程游玩没打开").font(.system(size: 16, weight: .bold))
+                    Text(e).font(.system(size: 12)).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
+                    PillButton(title: "重试", icon: "arrow.clockwise", filled: true) { model.onWebReload() }
+                        .padding(.top, 4)
+                } else {
+                    XboxGlow()
+                    Text("正在加载 Xbox 远程游玩").font(.system(size: 15, weight: .semibold))
+                    // 进度条（绿色）
+                    GeometryReader { g in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Theme.border)
+                            Capsule().fill(XboxGlow.green).frame(width: max(8, g.size.width * min(1, max(0.05, model.webProgress))))
+                                .animation(.easeOut(duration: 0.3), value: model.webProgress)
+                        }
+                    }
+                    .frame(width: 200, height: 3)
+                    Text("第一次打开会慢一点，网络慢时可能要十几秒").font(.system(size: 11)).foregroundStyle(Theme.faint)
+                }
+            }
+            .padding(24)
+        }
+    }
+}
+
+/// 原生 Xbox 串流连接中：和网页版加载一样的绿色光球，标题"正在连接 主机名"，下面是当前步骤
+struct ConnectingView: View {
+    let title: String, step: String
+    var body: some View {
+        ZStack {
+            Theme.bg
+            RadialGradient(colors: [XboxGlow.green.opacity(0.16), .clear], center: .center, startRadius: 0, endRadius: 420)
+            VStack(spacing: 14) {
+                XboxGlow()
+                Text(title).font(.system(size: 15, weight: .semibold))
+                Text(step).font(.system(size: 12)).foregroundStyle(Theme.muted)
+                    .animation(.easeOut(duration: 0.2), value: step)
+            }
+            .padding(24)
+        }
+    }
+}
+
+/// 加载动画：中间一颗绿色光球在呼吸（1.6 秒一次），外面两段弧线反向慢转
+struct XboxGlow: View {
+    static let green = Color(red: 16 / 255, green: 185 / 255, blue: 60 / 255)
+    var body: some View {
+        TimelineView(.animation) { t in
+            let s = t.date.timeIntervalSinceReferenceDate
+            let breath = (sin(s * 2 * .pi / 1.6) + 1) / 2          // 0~1
+            ZStack {
+                // 外面的光晕
+                Circle().fill(XboxGlow.green.opacity(0.18 + 0.17 * breath))
+                    .frame(width: 70, height: 70)
+                    .blur(radius: 18)
+                    .scaleEffect(0.9 + 0.25 * breath)
+                // 光球：上亮下暗，有立体感
+                Circle()
+                    .fill(RadialGradient(colors: [Color(red: 120 / 255, green: 235 / 255, blue: 140 / 255), XboxGlow.green, Color(red: 6 / 255, green: 90 / 255, blue: 30 / 255)],
+                                         center: UnitPoint(x: 0.38, y: 0.32), startRadius: 1, endRadius: 30))
+                    .frame(width: 38, height: 38)
+                    .scaleEffect(0.94 + 0.08 * breath)
+                    .shadow(color: XboxGlow.green.opacity(0.5 + 0.3 * breath), radius: 10)
+                // 两段弧线，反向转
+                Circle().trim(from: 0, to: 0.22)
+                    .stroke(XboxGlow.green.opacity(0.9), style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .frame(width: 62, height: 62)
+                    .rotationEffect(.degrees(s.truncatingRemainder(dividingBy: 1.4) / 1.4 * 360))
+                Circle().trim(from: 0, to: 0.12)
+                    .stroke(XboxGlow.green.opacity(0.5), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .frame(width: 74, height: 74)
+                    .rotationEffect(.degrees(-s.truncatingRemainder(dividingBy: 2.2) / 2.2 * 360))
+            }
+            .frame(width: 90, height: 90)
+        }
+    }
+}
+
+/// 放内嵌网页的位置（网页本身由 WebStreamHost 挪进挪出）
+struct WebSlot: NSViewRepresentable {
+    let view: NSView
+    func makeNSView(context: Context) -> NSView { view }
+    func updateNSView(_ v: NSView, context: Context) {}
+}
+
 struct Stage: View {
     @ObservedObject var model: UIModel
     let video: NSView
@@ -398,7 +531,32 @@ struct Stage: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(model.isFullScreen ? 0 : 16)
-            if !model.hasInput && !model.opening {
+            if let nc = model.nativeConnecting, model.hasInput || model.opening {
+                ConnectingView(title: nc.title, step: nc.step)
+                    .clipShape(RoundedRectangle(cornerRadius: model.isFullScreen ? 0 : 8, style: .continuous))
+                    .padding(model.isFullScreen ? 0 : 16)
+                    .transition(.opacity)
+            }
+            if model.webMode, let slot = model.webSlot {
+                // 内嵌 Xbox 网页：直接在画面区里操作（登录、选主机 / 游戏）
+                WebSlot(view: slot)
+                    .overlay {
+                        if model.webLoading || model.webError != nil {
+                            WebLoadingView(model: model).transition(.opacity)
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.3), value: model.webLoading)
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: model.isFullScreen ? 0 : 8, style: .continuous))
+                    .overlay {
+                        if !model.isFullScreen {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.border)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(model.isFullScreen ? 0 : 16)
+                    .background(model.isFullScreen ? Color.black : Theme.bg)
+            } else if !model.hasInput && !model.opening {
                 IdleView(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Theme.bg)
@@ -411,7 +569,8 @@ struct Stage: View {
 }
 
 /// 没有输入时的首页（2026-11-21 重做：原来的布局、文案和 Genki Arcade 网页太像——居中大标题、01/02/03 三张步骤卡、
-/// 带 ◆ 的横条——准备开源前改成自己的：左对齐的标题，两张并排的"来源"卡片（采集卡 / 串流窗口），下面一行主机配置）
+/// 带 ◆ 的横条——准备开源前改成自己的：左对齐的标题 + 画面来源）
+/// 2026-11-27 再改：两大块并排——「采集卡」（选主机一键配置收进来）和「串流」（Xbox / PlayStation / 模拟器 / 其他分页）
 struct IdleView: View {
     @ObservedObject var model: UIModel
 
@@ -435,11 +594,11 @@ struct IdleView: View {
                 }
                 .padding(.bottom, 4)
                 Text("选择画面来源").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.faint)
-                HStack(alignment: .top, spacing: 14) {
-                    CaptureSourceCard(model: model, cards: cards)
-                    WindowSourceCard(model: model)
+                HStack(alignment: .top, spacing: 16) {
+                    CaptureBlock(model: model, cards: cards)
+                    StreamBlock(model: model)
                 }
-                if let w = model.wizard { WizardBanner(w: w, model: model) }
+                .fixedSize(horizontal: false, vertical: true)   // 两块一样高
                 if let m = model.message {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.accent)
@@ -452,7 +611,7 @@ struct IdleView: View {
                     .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.accent.opacity(0.5)))
                 }
             }
-            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: 860, alignment: .leading)
             .padding(.vertical, 40)
             .padding(.horizontal, 28)
             .frame(maxWidth: .infinity)
@@ -461,88 +620,297 @@ struct IdleView: View {
     }
 }
 
-/// 首页的来源卡片外框：上面图标 + 标题 + 状态，中间说明，下面按钮
-struct SourceCard<Actions: View>: View {
-    let icon: String, title: String, status: String, statusOn: Bool, detail: String, tint: Color
-    var tabs: [String] = []                 // 有的话标题下面显示分页（串流 / 模拟器）
-    var tab = 0
-    var onTab: (Int) -> Void = { _ in }
-    @ViewBuilder let actions: Actions
+/// 首页的大板块：上面图标 + 标题 + 副标题 + 状态，下面是内容（顶上一层很淡的主题色）
+struct BigBlock<Content: View>: View {
+    let icon: String, title: String, subtitle: String, tint: Color
+    let status: String, statusOn: Bool
+    @ViewBuilder let content: Content
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Image(systemName: icon).font(.system(size: 18, weight: .semibold)).foregroundStyle(tint)
-                    .frame(width: 36, height: 36)
-                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-                Text(title).font(.system(size: 16, weight: .bold))
-                Spacer(minLength: 4)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: icon).font(.system(size: 20, weight: .semibold)).foregroundStyle(tint)
+                    .frame(width: 44, height: 44)
+                    .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 18, weight: .bold))
+                    Text(subtitle).font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.faint)
+                }
+                Spacer(minLength: 6)
                 HStack(spacing: 5) {
                     Circle().fill(statusOn ? Theme.ok : Theme.faint).frame(width: 6, height: 6)
                     Text(status).font(.system(size: 11, weight: .medium)).foregroundStyle(statusOn ? Theme.ok : Theme.muted).lineLimit(1)
                 }
+                .padding(.horizontal, 9).frame(height: 22)
+                .background((statusOn ? Theme.ok : Theme.faint).opacity(0.10), in: Capsule())
             }
-            if !tabs.isEmpty { Segmented(labels: tabs, selection: tab, onSelect: onTab) }
-            Text(detail).font(.system(size: 12)).foregroundStyle(Theme.muted).lineSpacing(2)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            HStack(spacing: 8) { actions }
+            content
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
-        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.border))
+        .padding(18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            ZStack {
+                Theme.surface
+                LinearGradient(colors: [tint.opacity(0.09), .clear], startPoint: .top, endPoint: .center)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Theme.border))
     }
 }
 
-/// 采集卡（HDMI）
-struct CaptureSourceCard: View {
+/// 板块里的一行（设备、主机、找到的窗口）：图标 + 两行字 + 右边可选按钮
+struct InsetRow<Trailing: View>: View {
+    let icon: String, title: String, detail: String
+    var on = true
+    var highlight = false
+    @ViewBuilder let trailing: Trailing
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(on ? Theme.text : Theme.faint)
+                .frame(width: 28, height: 28)
+                .background(Theme.bg.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(on ? Theme.text : Theme.muted).lineLimit(1)
+                if !detail.isEmpty {
+                    Text(detail).font(.system(size: 11)).foregroundStyle(Theme.muted).lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 6)
+            trailing
+        }
+        .padding(10)
+        .background(Theme.bg.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(highlight ? Theme.accent.opacity(0.45) : Theme.border.opacity(0.7)))
+    }
+}
+extension InsetRow where Trailing == EmptyView {
+    init(icon: String, title: String, detail: String, on: Bool = true) {
+        self.init(icon: icon, title: title, detail: detail, on: on, highlight: false) { EmptyView() }
+    }
+}
+
+/// 小按钮（板块里一行右边用）
+struct SmallButton: View {
+    let title: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.text)
+                .padding(.horizontal, 10).frame(height: 24)
+                .overlay(Capsule().strokeBorder(Theme.borderHover))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 采集卡（HDMI）：设备 + 主机配置（原来单独一条的「选主机」收进来）+ 连接
+struct CaptureBlock: View {
     @ObservedObject var model: UIModel
     let cards: [SourceOption]
     var body: some View {
-        SourceCard(icon: "cable.connector", title: "采集卡（HDMI）",
-                   status: cards.first?.title ?? "未检测到", statusOn: !cards.isEmpty,
-                   detail: cards.isEmpty
-                       ? "主机 HDMI 接采集卡，采集卡用 USB-C 接到 Mac（USB 3 以上）。插上后这里会显示设备名，不用装驱动。"
-                       : "画面和声音都从采集卡来，延迟最低。" + (cards.count > 1 ? "共 \(cards.count) 个设备，可在设置里换。" : ""),
-                   tint: Theme.ok) {
-            if cards.isEmpty {
-                PillButton(title: "重新检测", icon: "arrow.clockwise", filled: false) { model.onRefresh() }
+        BigBlock(icon: "cable.connector", title: "采集卡", subtitle: "HDMI · 延迟最低", tint: Theme.ok,
+                 status: cards.isEmpty ? "未检测到" : "已连接", statusOn: !cards.isEmpty) {
+            Text(cards.isEmpty
+                 ? "主机 HDMI 接采集卡，采集卡用 USB-C 接到 Mac（USB 3 以上）。插上后这里会显示设备名，不用装驱动。"
+                 : "画面和声音都从采集卡来，延迟最低。")
+                .font(.system(size: 12)).foregroundStyle(Theme.muted).lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+            if let c = cards.first {
+                InsetRow(icon: "cable.connector.horizontal", title: c.title,
+                         detail: cards.count > 1 ? "共 \(cards.count) 个设备，可在设置里换" : "")
             } else {
-                PillButton(title: "连接", icon: "bolt.fill", filled: true) { model.onStartStop() }
+                InsetRow(icon: "cable.connector.horizontal", title: "没有检测到采集卡", detail: "", on: false)
+            }
+            if let w = model.wizard { ConsoleRow(w: w, model: model) }
+            Spacer(minLength: 0)
+            HStack(spacing: 8) {
+                if cards.isEmpty {
+                    PillButton(title: "重新检测", icon: "arrow.clockwise", filled: false) { model.onRefresh() }
+                } else {
+                    PillButton(title: "连接", icon: "bolt.fill", filled: true) { model.onStartStop() }
+                }
             }
         }
     }
 }
 
-/// 窗口来源：分两页——串流（PS Remote Play、Moonlight、Chiaki…；网页版 Xbox 串流暂不支持）和模拟器（Dolphin、PCSX2…）。
-/// 两者都是抓窗口画面补帧，但要做的准备不同，分开说明、分开找窗口
-struct WindowSourceCard: View {
+/// 主机配置那一行：没配置过时高亮，请用户先选主机
+struct ConsoleRow: View {
+    @ObservedObject var w: WizardModel
     @ObservedObject var model: UIModel
     var body: some View {
-        let emu = model.windowKind == 1
-        let found = model.windowOptions.filter { emu ? !$0.emulator.isEmpty : $0.streaming }
-        let status = !model.screenAccess ? "需要录屏权限"
-            : (found.first.map { $0.app } ?? (emu ? "未发现模拟器" : "未发现串流 App"))
-        let detail = !model.screenAccess
-            ? "要读取别的 App 的窗口，需要在系统设置里打开「录屏与系统录音」权限。"
-            : emu
-                ? L("从 Dolphin、PCSX2、RetroArch 等模拟器的窗口取画面补帧（2 倍）。手柄要在模拟器里打开后台输入。") + (Lang.english ? " " : "") + Emulator.refreshNote
-                : "从 PS Remote Play、Moonlight、Chiaki 等串流 App 的窗口取画面补帧，不用采集卡。暂不支持网页版 Xbox 串流（xbox.com/play）"
-        SourceCard(icon: emu ? "gamecontroller" : "macwindow.on.rectangle", title: "窗口",
-                   status: status, statusOn: model.screenAccess && !found.isEmpty, detail: detail, tint: Theme.violet,
-                   tabs: ["串流", "模拟器"], tab: model.windowKind, onTab: { model.windowKind = $0 }) {
-            if !model.screenAccess {
-                PillButton(title: "授权录屏", icon: "lock.open", filled: false) { model.onOpenWindowPicker() }
-            } else if let first = found.first {
-                PillButton(title: "连接", icon: "bolt.fill", filled: true) { model.onSelect(first.source) }
-                PillButton(title: "选其他窗口", icon: "rectangle.on.rectangle", filled: false) { model.onOpenWindowPicker() }
-            } else {
-                PillButton(title: "选择窗口", icon: "rectangle.on.rectangle", filled: false) { model.onOpenWindowPicker() }
+        let configured = !w.appliedSummary.isEmpty
+        InsetRow(icon: "gamecontroller.fill", title: configured ? "主机配置" : "按主机一键设置",
+                 detail: configured ? w.appliedSummary : "PS5 / PS5 Pro / Xbox Series S / X：自动设好采集分辨率、补帧和锐化",
+                 highlight: !configured) {
+            SmallButton(title: configured ? "换主机" : "选主机") { model.onOpenWizard() }
+        }
+    }
+}
+
+/// 串流：不用采集卡，抓串流 App / 模拟器的窗口补帧。主要是 Xbox（内嵌网页）和 PlayStation；模拟器、其他窗口是次要入口
+struct StreamBlock: View {
+    @ObservedObject var model: UIModel
+
+    // 2026-11-27：Xbox / PlayStation 做成两个大选项；模拟器降成底下的小按钮；其他串流 App 不单独做页，收成「其他窗口…」
+    private var tab: Int { min(model.streamTab, 2) }   // 0 Xbox / 1 PlayStation / 2 模拟器
+    private var found: [SourceOption] {
+        model.windowOptions.filter { tab == 2 ? !$0.emulator.isEmpty : ($0.platform == tab && !$0.unsupported) }
+    }
+    #if FI_XNATIVE
+    @ObservedObject var acc = XboxAccount.shared   // 登录状态变了要刷新
+    private let nativeBuild = true
+    #else
+    private let nativeBuild = false
+    #endif
+    /// 测试版：Xbox 用原生串流（不用录屏权限，不再有内嵌网页）
+    private var native: Bool { nativeBuild && tab == 0 }
+    private var detail: String {
+        if native { return "用微软账号登录，直接连你的 Xbox 主机：画面直接进补帧，不经过网页、不抓屏。（开发中）" }
+        if !model.screenAccess { return "串流要读取窗口画面，需要在系统设置里打开「录屏与系统录音」权限。" }
+        switch tab {
+        case 0: return "在 FrameInterp 里打开 Xbox 远程游玩：玩自己的主机，或玩云游戏。被挡住也照常播放，手柄由 FrameInterp 转过去。（实验）"
+        case 1: return "打开 PS Remote Play 或 chiaki-ng，连上主机后点「连接」。PS Remote Play 里画质选 1080p、帧率选「高」。"
+        default: return L("从 Dolphin、PCSX2、RetroArch 等模拟器的窗口取画面补帧（2 倍）。手柄要在模拟器里打开后台输入。") + (Lang.english ? " " : "") + Emulator.refreshNote
+        }
+    }
+    private var missing: String { ["", "没发现 PS Remote Play / chiaki-ng 的窗口", "没发现模拟器的窗口"][tab] }
+
+    var body: some View {
+        let first = found.first
+        let st = blockStatus(first)
+        BigBlock(icon: "dot.radiowaves.left.and.right", title: "串流", subtitle: "不用采集卡", tint: Theme.violet,
+                 status: st.0, statusOn: st.1) {
+            HStack(spacing: 10) {
+                PlatformTile(name: "Xbox", note: nativeBuild ? "原生串流 · 开发中" : "网页串流 · 内嵌", tint: Theme.ok, selected: tab == 0) { model.streamTab = 0 }
+                PlatformTile(name: "PlayStation", note: "Remote Play · chiaki-ng", tint: Theme.blue, selected: tab == 1) { model.streamTab = 1 }
+                // 模拟器：红色（任天堂的颜色，模拟器多数是任天堂主机），和 Xbox / PlayStation 并排，压成一个小方块（2026-11-27 用户要求；「其他窗口」去掉——除了这些没别的窗口要补帧）
+                CompactTile(icon: "gamecontroller", name: "模拟器", tint: Color(red: 230 / 255, green: 60 / 255, blue: 55 / 255), selected: tab == 2) { model.streamTab = 2 }
             }
-            if emu {
-                PillButton(title: "支持的模拟器", icon: "list.bullet", filled: false) { model.showEmulatorList = true }
+            .fixedSize(horizontal: false, vertical: true)
+            Text(detail).font(.system(size: 12)).foregroundStyle(Theme.muted).lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+            if native {
+                #if FI_XNATIVE
+                XboxNativeRow(connect: { c in model.onSelect(.xbox(serverId: c.id, name: c.name)) })
+                #endif
+            } else if model.screenAccess {
+                if tab == 0 {
+                    InsetRow(icon: "globe", title: "Xbox 网页（内嵌）", detail: "远程游玩 / 云游戏 · 登录、选游戏后点「开始补帧」")
+                }
+                if let f = first {
+                    InsetRow(icon: tab == 2 ? "gamecontroller" : "macwindow", title: f.app,
+                             detail: f.windowTitle.isEmpty ? f.size : "\(f.windowTitle) · \(f.size)") {
+                        SmallButton(title: "连接") { model.onSelect(f.source) }
+                    }
+                } else if tab != 0 {
+                    InsetRow(icon: tab == 2 ? "gamecontroller" : "macwindow", title: missing, detail: "", on: false)
+                }
+            }
+            Spacer(minLength: 0)
+            HStack(spacing: 8) {
+                if native {
+                    #if FI_XNATIVE
+                    XboxPrimaryButton(connect: { c in model.onSelect(.xbox(serverId: c.id, name: c.name)) })
+                    #endif
+                } else if !model.screenAccess {
+                    PillButton(title: "授权录屏", icon: "lock.open", filled: true) { openPicker(emulator: false) }
+                } else if tab == 0 {
+                    PillButton(title: "打开 Xbox 网页", icon: "globe", filled: true) { model.onWebXbox() }
+                } else if let f = first {
+                    PillButton(title: "连接", icon: "bolt.fill", filled: true) { model.onSelect(f.source) }
+                } else {
+                    PillButton(title: "选择窗口", icon: "rectangle.on.rectangle", filled: false) { openPicker(emulator: tab == 2) }
+                }
+                if tab == 2 {
+                    PillButton(title: "支持的模拟器", icon: "list.bullet", filled: false) { model.showEmulatorList = true }
+                }
+                Spacer(minLength: 0)
             }
         }
+    }
+
+    /// 右上角状态
+    private func blockStatus(_ first: SourceOption?) -> (String, Bool) {
+        #if FI_XNATIVE
+        if native { return XboxAccount.shared.statusText }
+        #endif
+        if !model.screenAccess { return ("需要录屏权限", false) }
+        if let f = first { return (f.app, true) }
+        return tab == 0 ? ("Xbox 网页可用", true) : ("未发现", false)
+    }
+
+    private func openPicker(emulator: Bool) {
+        model.windowKind = emulator ? 1 : 0
+        model.onOpenWindowPicker()
+    }
+}
+
+/// 串流平台大选项（Xbox / PlayStation）：选中时主题色描边 + 底色
+struct PlatformTile: View {
+    let name: String, note: String, tint: Color, selected: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Circle().fill(tint).frame(width: 8, height: 8)
+                    Text(name).font(.system(size: 15, weight: .bold)).foregroundStyle(selected ? Theme.text : Theme.text.opacity(0.75))
+                }
+                Text(note).font(.system(size: 10.5, weight: .medium)).foregroundStyle(Theme.muted).lineLimit(1)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? tint.opacity(0.14) : Theme.bg.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(selected ? tint.opacity(0.7) : Theme.border.opacity(0.7), lineWidth: selected ? 1.5 : 1))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 并排的小方块选项（模拟器）：只有图标和两个字，选中时主题色描边
+struct CompactTile: View {
+    let icon: String, name: String, tint: Color, selected: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 15, weight: .semibold)).foregroundStyle(tint)   // 图标一直是主题色（像另外两个的小圆点）
+                Text(name).font(.system(size: 10.5, weight: .semibold)).lineLimit(1).fixedSize()
+                    .foregroundStyle(selected ? Theme.text : Theme.muted)
+            }
+            .frame(width: 62).frame(maxHeight: .infinity)
+            .background(selected ? tint.opacity(0.16) : Theme.bg.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(selected ? tint.opacity(0.7) : Theme.border.opacity(0.7), lineWidth: selected ? 1.5 : 1))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 次要入口的小按钮（模拟器、其他窗口）：比主按钮小一号，有底色和描边，选中时更亮
+struct TextLink: View {
+    let title: String, icon: String, selected: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .bold))
+                Text(title).font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(selected ? Theme.text : Theme.text.opacity(0.8))
+            .padding(.horizontal, 10).frame(height: 26)
+            .background(selected ? Theme.violet.opacity(0.22) : Theme.bg.opacity(0.7), in: Capsule())
+            .overlay(Capsule().strokeBorder(selected ? Theme.violet.opacity(0.6) : Theme.borderHover))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -617,33 +985,6 @@ struct PillButton: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-    }
-}
-
-/// 待机页上的"配置向导"横条：没配置过时请用户先配置，配置过显示当前配置
-struct WizardBanner: View {
-    @ObservedObject var w: WizardModel
-    @ObservedObject var model: UIModel
-
-    var body: some View {
-        let configured = !w.appliedSummary.isEmpty
-        HStack(spacing: 12) {
-            Image(systemName: "gamecontroller.fill").font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Theme.accent)
-                .frame(width: 36, height: 36)
-                .background(Theme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(configured ? "主机配置" : "按主机一键设置").font(.system(size: 14, weight: .bold))
-                Text(configured ? w.appliedSummary : "PS5 / PS5 Pro / Xbox Series S / X：自动设好采集分辨率、补帧和锐化")
-                    .font(.system(size: 12)).foregroundStyle(Theme.muted).lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 8)
-            PillButton(title: configured ? "换主机" : "选主机", icon: "gamecontroller", filled: false) { model.onOpenWizard() }
-        }
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(configured ? Theme.border : Theme.accent.opacity(0.45)))
     }
 }
 
@@ -749,7 +1090,7 @@ struct WindowCard: View {
                 Text(option.windowTitle.isEmpty ? option.size : "\(option.windowTitle) · \(option.size)")
                     .font(.system(size: 11)).foregroundStyle(Theme.muted).lineLimit(1)
                 if option.unsupported {
-                    Text("网页版 Xbox 串流：浏览器失去焦点会暂停画面，暂不支持")
+                    Text("浏览器里的网页版 Xbox 失去焦点会暂停：请改用「Xbox 网页」（内嵌）")
                         .font(.system(size: 10)).foregroundStyle(Theme.amber).lineLimit(2)
                 }
             }
@@ -894,6 +1235,9 @@ struct Ticker: View {
                      ? "游戏 \(s.unique) FPS → 显示 \(s.displayed) FPS · 延迟 \(Int((s.capDelay + s.latency).rounded())) ms" + (s.interpOn ? " · 补一帧 \(f1(s.interpAvg)) ms" : "")
                      : "等待画面…")
                     .foregroundStyle(Theme.muted).monospacedDigit().lineLimit(1)
+            } else if model.webMode {
+                Text("Xbox 网页").foregroundStyle(Theme.violet).fontWeight(.semibold)
+                Text("在网页里登录、开始串流，然后点右上角「开始补帧」。手柄由 FrameInterp 转给网页").foregroundStyle(Theme.muted)
             } else {
                 Text(model.opening ? "正在打开…" : "没有输入").foregroundStyle(Theme.text.opacity(0.8)).fontWeight(.semibold)
                 Text("插上采集卡点「连接」，或选一个串流窗口").foregroundStyle(Theme.muted)
@@ -926,10 +1270,13 @@ struct SettingsPanel: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     inputSection
+                    #if FI_KEYPAD
+                    KeyPadSection(model: model)
+                    #endif
                     interpSection
                     pictureSection.id("picture")
                     displaySection
-                    advancedSection
+                    advancedSection.id("advanced")
                     statusSection
                 }
                 .padding(.horizontal, 14)
@@ -941,6 +1288,11 @@ struct SettingsPanel: View {
                 // 测试用：FI_SHOWSETTINGS=picture 打开时直接滚到画面设置（截图检查界面）
                 if ProcessInfo.processInfo.environment["FI_SHOWSETTINGS"] == "picture" {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { proxy.scrollTo("picture", anchor: .top) }
+                }
+                // FI_SHOWSETTINGS=advanced：展开高级选项并滚过去
+                if ProcessInfo.processInfo.environment["FI_SHOWSETTINGS"] == "advanced" {
+                    model.advancedOpen = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { proxy.scrollTo("advanced", anchor: .top) }
                 }
             }
             }
@@ -955,14 +1307,35 @@ struct SettingsPanel: View {
     private var inputSection: some View {
         SectionBlock(title: "输入来源", icon: "cable.connector") {
             Field("输入类型") {
-                Segmented(labels: ["采集卡", "串流窗口"], selection: model.inputMode) { model.inputMode = $0 }
+                Segmented(labels: ["采集卡", "串流"], selection: model.inputMode) { model.inputMode = $0 }
             }
-            if model.inputMode == 1 {
+            if model.inputMode == 1, (model.selectedID ?? "").hasPrefix("xbox:") {
+                nativeXboxInput
+            } else if model.inputMode == 1 {
                 windowInput
             } else {
                 cardInput
             }
         }
+    }
+
+    /// 原生 Xbox 串流：不是窗口，不显示窗口列表 / 裁黑边这些，只显示当前主机、画质、断开
+    @ViewBuilder
+    private var nativeXboxInput: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "gamecontroller.fill").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.ok)
+                .frame(width: 30, height: 30).background(Theme.ok.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.inputName.replacingOccurrences(of: "（原生串流）", with: "")).font(.system(size: 13, weight: .semibold))
+                Text("原生串流" + (model.sourceW > 0 ? " · \(model.sourceW)×\(model.sourceH)" : "")).font(.system(size: 11)).foregroundStyle(Theme.muted)
+            }
+            Spacer()
+            SmallButton(title: "断开") { model.onSelect(nil) }
+        }
+        #if FI_XNATIVE
+        XboxQualityField()
+        #endif
+        Hint("换主机：首页「串流 → Xbox」。Wi-Fi 下画面每隔约 0.5 秒顿一下，多半是隔空投送 / 接力（AWDL）在切频道，用网线或串流时关掉它最稳")
     }
 
     // 串流窗口
@@ -1019,10 +1392,8 @@ struct SettingsPanel: View {
             Hint(Emulator.refreshNote)
         }
         SwitchLine(title: "自动裁掉标题栏和黑边", isOn: Binding(get: { model.windowAutoCrop }, set: { model.onWindowAutoCrop($0) }))
-        Hint("游戏画面按 16:9 铺满、居中，不留黑边。开始后 3 秒内识别黑边；窗口大小变了会自动重新铺满。关掉则整个窗口按 16:9 铺满")
-        Hint("按窗口画面的原始像素采集（不再先缩到 1080p）；开补帧时补帧器在 1080p 上补。全屏时不会让串流 App 以为自己被挡住而降帧。声音由串流 App 自己播放。")
-        Hint("暂不支持网页版 Xbox 串流（Chrome / Edge / Safari 里的 xbox.com/play）：浏览器一失去焦点网页就暂停画面，和 FrameInterp 在前台显示补帧冲突。以后会把网页内嵌进 FrameInterp 来支持")
-        Hint("画面糊时先看串流 App 自己的画质：PS Remote Play → 设置 → 视频画质，分辨率选 1080p、帧率选「高」（默认可能是 720p）；串流窗口别拉得太小")
+        Hint("游戏画面按 16:9 铺满、不留黑边；窗口大小变了自动重新铺满")
+        Hint("画面糊时先看串流 App 自己的画质：PS Remote Play → 设置 → 视频画质，分辨率选 1080p、帧率选「高」；串流窗口别拉得太小")
         if model.inputMode == 1, model.hasInput, case .some(let id) = model.selectedID, id.hasPrefix("win:") { Hint(model.inputDetail) }
     }
 
@@ -1133,26 +1504,24 @@ struct SettingsPanel: View {
                    + "· 缩小（4K → 全屏）：按比例取样，细线、栅栏、小字不闪\n"
                    + "每帧约 1.5~4ms（GPU），延迟基本不变"
                  : "关：交给系统缩放（双线性，偏软）；下面的锐化在原分辨率上做")
-            if model.sharpScale {
-                SwitchLine(title: "2K / 4K 自动轻度锐化", isOn: tuningBinding(\.autoSharpHiRes))
-                Hint("采集分辨率是 2K / 4K 时（开补帧后也算），锐化至少用「柔和」（0.25）。主机输出 4K，但很多游戏内部只渲染 1440p 左右，画面会偏软")
-                SwitchLine(title: "缩小防闪烁", isOn: tuningBinding(\.antiFlickerDown))
-                Hint("采集分辨率比显示区域大很多时（4K 采集，或 2K 放进小窗口，缩到 0.85 倍以下）才起作用；开补帧、串流窗口模式时画面是 1080p，不会用到。关掉每帧省约 2ms，但画面移动时细线、栅栏、树叶会闪、出摩尔纹")
-                SwitchLine(title: "压缩传输时减弱锐化", isOn: tuningBinding(\.compressedSoftSharp))
-                Hint("开了「压缩传输（MJPEG）」时锐化减半，免得把压缩方块和字边的波纹一起放大。不压缩时不起作用")
-            }
-            Field("锐化") {
-                Segmented(labels: ["关", "柔和", "标准", "锐利", "最锐"], selection: model.sharpLevel) {
-                    model.sharpLevel = $0; model.onTuning()
+            // 2026-11-28：锐化档位和"2K / 4K 自动轻度锐化"同步显示——自动生效时档位直接亮在「柔和」；手动点「关」= 真的关（连自动一起关）
+            let autoOn = model.sharpScale && model.autoSharpHiRes && model.sourceH >= 1440 && model.sharpLevel == 0
+            Field(autoOn ? "锐化（2K / 4K 输入，自动用柔和）" : "锐化") {
+                Segmented(labels: ["关", "柔和", "标准", "锐利", "最锐"], selection: autoOn ? 1 : model.sharpLevel) { i in
+                    if i == 0 { model.autoSharpHiRes = false }
+                    model.sharpLevel = i; model.onTuning()
                 }
             }
+            if model.sharpScale {
+                SwitchLine(title: "2K / 4K 输入自动轻度锐化", isOn: tuningBinding(\.autoSharpHiRes))
+            }
             Hint([
-                "关（默认）：不额外锐化" + (model.sharpScale && model.autoSharpHiRes ? "；2K / 4K 输入仍会自动轻度锐化" : ""),
+                autoOn ? "现在是 2K / 4K 输入，自动用「柔和」。点「关」会连自动一起关" : "关：不额外锐化" + (model.sharpScale && model.autoSharpHiRes ? "（2K / 4K 输入时自动用柔和）" : ""),
                 "柔和 0.25：边缘稍微清楚一点，几乎没有副作用。1080p 画面推荐",
                 "标准 0.5：明显清楚，适合偏软的画面（游戏内部低分辨率渲染、开了动态模糊）",
                 "锐利 0.75：画面偏糊时试试；草地、树叶在动时可能有点闪",
                 "最锐 1.0：最强；文字边缘可能出现白边，草地闪烁，不建议一直开",
-            ][model.sharpLevel] + "\n锐化只加强亮度（明暗）边缘，不动颜色，所以不会出彩边")
+            ][autoOn ? 0 : model.sharpLevel] + "。只加强明暗边缘，不出彩边")
             if !model.enhanceStatus.isEmpty { Hint(model.enhanceStatus) }
         }
     }
@@ -1197,6 +1566,17 @@ struct SettingsPanel: View {
                 } else {
                     option("补帧锐化", ["关", "只补帧", "全部"], \.interpSharpLevel, [
                         "关：不锐化", "只锐化补出来的帧（柔和），真实帧不动", "所有帧都锐化（柔和），观感一致"])
+                }
+                // 2026-11-27：这两项从「画质」挪到高级（一般不用改）
+                if model.sharpScale {
+                    SwitchLine(title: "缩小防闪烁", isOn: tuningBinding(\.antiFlickerDown))
+                    Hint("采集分辨率比显示区域大很多时（4K 采集，或 2K 放进小窗口，缩到 0.85 倍以下）才起作用；开补帧、串流窗口模式时画面是 1080p，不会用到。关掉每帧省约 2ms，但画面移动时细线、栅栏、树叶会闪、出摩尔纹")
+                    SwitchLine(title: "压缩传输时减弱锐化", isOn: tuningBinding(\.compressedSoftSharp))
+                    Hint("开了「压缩传输（MJPEG）」时锐化减半，免得把压缩方块和字边的波纹一起放大。不压缩时不起作用")
+                } else {
+                    Field("缩小防闪烁") {
+                        Hint("清晰放大关着时这一项和「压缩传输时减弱锐化」都不起作用")
+                    }
                 }
                 option("延迟和流畅", ["低延迟", "平衡", "流畅"], \.smoothLevel, [
                     "低延迟：排队最短；游戏帧率不稳时每秒会丢几帧", "平衡：一般情况用这个，不丢帧", "流畅：多排一帧，帧率很不稳的游戏更稳；延迟多约 17ms"])
@@ -1273,19 +1653,23 @@ struct SectionBlock<Content: View, Trailing: View>: View {
     init(title: String, icon: String = "circle", @ViewBuilder trailing: () -> Trailing = { EmptyView() }, @ViewBuilder content: () -> Content) {
         self.title = title; self.icon = icon; self.trailing = trailing(); self.content = content()
     }
+    // 2026-11-28 改成 macOS 系统设置那样的分组卡片：标题在卡片外，内容放在圆角卡片里（原来是平铺 + 底部细线，挤）
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Image(systemName: icon).font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.accent)
-                Text(title).font(.system(size: 14, weight: .bold))
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.accent)
+                Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.text.opacity(0.85))
                 Spacer()
                 trailing
             }
-            .padding(.top, 14)
-            content
+            .padding(.horizontal, 4)
+            VStack(alignment: .leading, spacing: 9) { content }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.surface.opacity(0.75), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.border.opacity(0.8)))
         }
-        .padding(.bottom, 12)
-        .overlay(alignment: .bottom) { Theme.border.frame(height: 1) }
+        .padding(.top, 14)
     }
 }
 
@@ -1296,7 +1680,7 @@ struct Field<Content: View>: View {
     init(_ label: String, @ViewBuilder content: () -> Content) { self.label = label; self.content = content() }
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(label).font(.system(size: 10, weight: .medium)).tracking(1.0).foregroundStyle(Theme.muted)
+            Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.muted)
             content
         }
         .padding(.top, 2)
@@ -1308,7 +1692,7 @@ struct Hint: View {
     init(_ t: String) { text = t }
     var body: some View {
         if !text.isEmpty {
-            Text(text).font(.system(size: 11)).foregroundStyle(Theme.muted).lineSpacing(1.5)
+            Text(text).font(.system(size: 11)).foregroundStyle(Theme.faint).lineSpacing(1.5)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }

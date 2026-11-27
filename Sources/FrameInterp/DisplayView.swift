@@ -37,7 +37,11 @@ final class DisplayView: NSView {
 
     // 叠加文字：中间的提示、上方的短暂提示、左上角的统计
     private let messageLayer = CATextLayer()
-    private let flashLayer = CATextLayer()
+    private let flashLayer = CATextLayer()   // 旧的短暂提示（不再显示，留着免得改布局）
+    // 短暂提示（2026-11-28 重做：原来是固定 300×30 的黑底文字条，用户说粗糙）：毛玻璃胶囊，宽度跟着文字，左边小图标，淡入淡出
+    private let toast = NSVisualEffectView()
+    private let toastIcon = NSImageView()
+    private let toastLabel = NSTextField(labelWithString: "")
     // 左上角浮窗（帧数 / 延迟）：毛玻璃小条，是窗口里的独立视图，
     // 不进视频帧，所以不会被补帧或锐化
     private let hud = NSVisualEffectView()
@@ -77,6 +81,23 @@ final class DisplayView: NSView {
         messageLayer.alignmentMode = .center
         flashLayer.alignmentMode = .center
         flashLayer.cornerRadius = 15
+        toast.material = .hudWindow
+        toast.blendingMode = .withinWindow
+        toast.state = .active
+        toast.wantsLayer = true
+        toast.layer?.masksToBounds = true
+        toast.layer?.borderWidth = 1
+        toast.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        toast.alphaValue = 0
+        toast.isHidden = true
+        toastLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        toastLabel.textColor = .white
+        toastLabel.maximumNumberOfLines = 2
+        toastLabel.lineBreakMode = .byTruncatingTail
+        toastIcon.imageScaling = .scaleProportionallyUpOrDown
+        toast.addSubview(toastIcon)
+        toast.addSubview(toastLabel)
+        addSubview(toast)
         hud.material = .hudWindow
         hud.blendingMode = .withinWindow
         hud.state = .active
@@ -122,6 +143,7 @@ final class DisplayView: NSView {
         messageLayer.frame = CGRect(x: (b.width - mw) / 2, y: b.height / 2 - 50, width: mw, height: 100)
         flashLayer.frame = CGRect(x: (b.width - 300) / 2, y: 24, width: 300, height: 30)
         layoutHud()
+        if !toast.isHidden { layoutToast() }
         markerLayer.frame = CGRect(x: b.width - 32, y: b.height - 32, width: 18, height: 18)
         CATransaction.commit()
     }
@@ -139,14 +161,47 @@ final class DisplayView: NSView {
     func flash(_ text: String) {
         flashToken += 1
         let tok = flashToken
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        flashLayer.string = L(text)
-        flashLayer.isHidden = false
-        CATransaction.commit()
+        // 图标和颜色按内容选：补帧开 = 亮色星星，补帧关 = 灰色，⚠ = 黄色三角，其他 = 信息
+        var t = L(text)
+        let (sym, color): (String, NSColor)
+        if t.hasPrefix("⚠") { t = String(t.dropFirst()).trimmingCharacters(in: .whitespaces); (sym, color) = ("exclamationmark.triangle.fill", .systemYellow) }
+        else if text.contains("补帧：开") || text.contains("Interpolation: on") { (sym, color) = ("sparkles", NSColor(red: 120 / 255, green: 132 / 255, blue: 1, alpha: 1)) }
+        else if text.contains("补帧：关") || text.contains("Interpolation: off") { (sym, color) = ("sparkles", .secondaryLabelColor) }
+        else { (sym, color) = ("info.circle.fill", .secondaryLabelColor) }
+        toastIcon.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+        toastIcon.contentTintColor = color
+        toastLabel.stringValue = t
+        layoutToast()
+        toast.isHidden = false
+        let shown = toast.alphaValue > 0.5
+        if !shown { toast.frame.origin.y += 8 }
+        NSAnimationContext.runAnimationGroup { c in
+            c.duration = 0.18
+            toast.animator().alphaValue = 1
+            if !shown { toast.animator().frame.origin.y -= 8 }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self, self.flashToken == tok else { return }
-            self.flashLayer.isHidden = true
+            NSAnimationContext.runAnimationGroup({ c in
+                c.duration = 0.25
+                self.toast.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                MainActor.assumeIsolated { if let self, self.flashToken == tok { self.toast.isHidden = true } }
+            })
         }
+    }
+
+    /// 提示的大小和位置：宽度跟着文字（最宽画面的 70%），在画面上方居中
+    private func layoutToast() {
+        let maxW = max(200, bounds.width * 0.7)
+        toastLabel.preferredMaxLayoutWidth = maxW - 60
+        let ls = toastLabel.sizeThatFits(NSSize(width: maxW - 60, height: 200))
+        let h = max(36, ceil(ls.height) + 16), w = min(maxW, ceil(ls.width) + 58)
+        toast.frame = CGRect(x: (bounds.width - w) / 2, y: bounds.height - 22 - h, width: w, height: h)
+        toast.layer?.cornerRadius = min(h / 2, 18)
+        toastIcon.frame = CGRect(x: 16, y: (h - 18) / 2, width: 18, height: 18)
+        toastLabel.frame = CGRect(x: 42, y: (h - ceil(ls.height)) / 2, width: w - 58, height: ceil(ls.height))
     }
 
     /// 左上角浮窗（nil = 隐藏），一行：帧数 · 延迟

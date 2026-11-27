@@ -14,6 +14,7 @@ FrameInterp 从 USB 采集卡（或串流 App 的窗口）取画面，去掉重�
 - **30 → 60 帧**：用 Apple 的 `VTLowLatencyFrameInterpolation`，M2 上每帧约 18ms。
 - **采集卡**：系统能当摄像头认出来的 USB 采集卡都能用（Genki ShadowCast、Elgato、AVerMedia、MS2109 方案的卡等），
   支持 1080p / 2K / 4K、60 / 120 帧；USB 带宽不够时自动退到能跑的档。
+- **原生 Xbox 串流（实验）**：登录微软账号，在列表里选你的 Xbox，画面直接串进 FrameInterp——不用采集卡、不用浏览器。和主机在同一个网络时效果最好（最高 1440p60）；走公网时主机按网速自己定分辨率。Wi-Fi 下 macOS 的 AWDL（隔空投送 / 接力）可能引起周期性小卡顿，用网线可以避开。
 - **串流窗口**：PS Remote Play、Moonlight、Chiaki 等串流 App 的窗口，按原始像素采集；串流窗口是系统全屏（单独一个桌面）也能用。
 - **模拟器窗口**：能认出 Dolphin、PCSX2、DuckStation、PPSSPP、RetroArch、RPCS3 等 Mac 模拟器，并列出每个模拟器要改的设置（后台输入、失去焦点暂停）。请用手柄操作，键盘鼠标会被 FrameInterp 收走。60 帧的游戏要 120Hz 屏幕才能补到 120。
 - **字幕和提示保护**：停住不动的字幕、HUD，在补出来的帧里用真实画面，不闪、不变形。
@@ -33,8 +34,8 @@ FrameInterp 从 USB 采集卡（或串流 App 的窗口）取画面，去掉重�
 
 ### 暂不支持
 
-- **网页版 Xbox 串流（浏览器里的 xbox.com/play）**：浏览器一失去焦点网页就暂停，和 FrameInterp 在前台显示补帧冲突。
-  以后打算把网页内嵌进 FrameInterp 来支持。
+- **网页版 Xbox 串流（浏览器里的 xbox.com/play）**：浏览器一失去焦点网页就暂停。请用内置的原生 Xbox 串流。
+- 原生 Xbox 串流的手柄震动。
 - HDR 采集（请在主机上关掉 HDR）。
 
 ## 安装
@@ -63,6 +64,9 @@ swift build -c release          # 程序：.build/release/FrameInterp
 ./make-app.sh                   # 生成 FrameInterp.app（自签名）
 ./make-release.sh               # 在上一级文件夹生成 DMG
 ```
+
+原生 Xbox 串流要用 WebRTC 框架（社区编译的 Google WebRTC，BSD 许可），不在仓库里。先运行一次 `tools/fetch-webrtc.sh`
+下载到 `Vendor/` 并核对校验和，之后 `./make-app.sh` 就会带上原生串流；没有它时编出来的版本不带原生串流。
 
 需要 macOS 26+ 和 Xcode 26 / Swift 6 工具链。技术笔记见 [docs/DEV-NOTES.zh-CN.md](docs/DEV-NOTES.zh-CN.md)，更新记录见 [更新日志.txt](更新日志.txt)。
 

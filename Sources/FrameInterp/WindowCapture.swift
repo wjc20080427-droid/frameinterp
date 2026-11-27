@@ -30,6 +30,13 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// 本程序自己的窗口（内嵌网页串流），不在窗口列表里（列表只要别的 App 的、层级 0 的窗口）
+    static func ownWindow(_ id: CGWindowID) async throws -> SCWindow? {
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        let mine = ProcessInfo.processInfo.processIdentifier
+        return content.windows.first { $0.windowID == id && $0.owningApplication?.processID == mine }
+    }
+
     /// 系统全屏（单独一个桌面）的窗口：和某块屏幕一样宽、左边对齐、高度超过屏幕六成。
     /// 高度不能要求等于屏幕：有刘海的屏幕少一条菜单栏（1470×923），Chrome 全屏还显示标签栏时更矮（实测 1470×835，上面另有几条工具栏窗口）
     static func isNativeFullScreen(_ w: SCWindow) -> Bool { isFullWidth(w.frame) }
@@ -74,6 +81,16 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             .contains { s.contains($0) }
     }
 
+    /// 首页「串流」板块按平台分页：0 Xbox（Greenlight、XboxPad、Xbox App、浏览器里的 xCloud），1 PlayStation（PS Remote Play、chiaki-ng），
+    /// 3 其他串流（Moonlight、Parsec、Steam Link…）；不是串流窗口返回 -1
+    static func platform(_ w: SCWindow) -> Int {
+        guard isStreaming(w) else { return -1 }
+        let s = ((w.owningApplication?.applicationName ?? "") + " " + (w.owningApplication?.bundleIdentifier ?? "") + " " + (w.title ?? "")).lowercased()
+        if ["xbox", "xcloud", "greenlight"].contains(where: { s.contains($0) }) { return 0 }
+        if ["remote play", "remoteplay", "ps remote", "playstation", "chiaki", "远程游玩"].contains(where: { s.contains($0) }) && !s.contains("steam") { return 1 }
+        return 3
+    }
+
     /// 浏览器里的 Xbox 网页串流（xbox.com/play）：暂不支持。
     /// 2026-11-22 用户实测是硬伤：浏览器一失去焦点网页就暂停（「点击继续」），而 FrameInterp 要在前台显示补帧画面，两者冲突；
     /// 试过让浏览器留在前台、FrameInterp 只盖一层显示（覆盖模式），补帧不稳定。以后打算把网页内嵌进 FrameInterp 解决
@@ -90,6 +107,7 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 自动裁掉标题栏和黑边（设置里可关）
     var autoCrop = true
     var onLog: ((String) -> Void)?
+    var contentOverride: CGRect?               // 内嵌网页窗口：网页在窗口里的确切位置（点，左上角为原点）
     static let titleBar: CGFloat = 32          // macOS 26 标准标题栏高度（点；实测 640×360 的窗口整体是 640×392）
     private(set) var windowID: CGWindowID = 0
     private var windowSize = CGSize.zero
@@ -139,6 +157,7 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// 窗口里游戏画面的初始范围：去掉标题栏（关掉自动裁剪时就是整个窗口）
     private func baseContent() -> CGRect {
+        if let r = contentOverride { return r }   // 自己的窗口（内嵌网页）：网页的位置是确切知道的
         if autoCrop, windowSize.height > 200, !fullScreen {
             return CGRect(x: 0, y: WindowCapture.titleBar, width: windowSize.width, height: windowSize.height - WindowCapture.titleBar)
         }

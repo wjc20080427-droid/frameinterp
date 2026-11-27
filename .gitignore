@@ -12,3 +12,6 @@ dist/
 # Old promo screenshot and generated icon files
 promo/
 build-assets/
+.build-test/
+Vendor/
+.build-native/

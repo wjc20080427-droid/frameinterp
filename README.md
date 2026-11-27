@@ -14,6 +14,7 @@ result on your Mac's screen. Audio from the capture card is passed straight thro
 
 - **30 → 60 fps** with Apple's `VTLowLatencyFrameInterpolation` (runs on the Media Engine / Neural Engine, about 18 ms per frame on an M2).
 - **Capture cards**: any USB (UVC) capture card that macOS sees as a camera — Genki ShadowCast, Elgato, AVerMedia, MS2109-based cards… 1080p / 2K / 4K, 60 / 120 fps, automatic fallback when USB bandwidth is not enough.
+- **Native Xbox streaming (experimental)**: sign in with your Microsoft account, pick your Xbox from the list and stream it straight into FrameInterp — no capture card, no browser. Works best on the same network as the console (up to 1440p60); over the internet the console picks the resolution from your bandwidth. On Wi-Fi, macOS AWDL (AirDrop / Handoff) can cause periodic short stutters; a wired connection avoids it.
 - **Streaming windows**: PS Remote Play, Moonlight, Chiaki and similar apps, captured at their native pixels. Windows in a separate full-screen Space are supported.
 - **Emulator windows**: Dolphin, PCSX2, DuckStation, PPSSPP, RetroArch, RPCS3 and other Mac emulators are recognized, with a list of the settings to change in each (background input, pause on focus loss). Use a controller: keyboard and mouse go to FrameInterp. A 60 fps game needs a 120 Hz screen to reach 120 fps.
 - **Subtitle & HUD guard**: subtitles and HUD elements that stay still are copied from the real frame, so they don't shimmer or warp in interpolated frames.
@@ -34,8 +35,8 @@ result on your Mac's screen. Audio from the capture card is passed straight thro
 ### Not supported (yet)
 
 - **Web-based Xbox streaming (xbox.com/play in a browser).** The web page pauses as soon as the browser loses
-  focus, which conflicts with FrameInterp showing the interpolated picture in front. Embedding the page inside
-  FrameInterp is planned.
+  focus. Use the built-in native Xbox streaming instead.
+- Controller rumble in native Xbox streaming.
 - HDR capture (turn HDR off on the console).
 
 ## Install
@@ -67,6 +68,10 @@ swift build -c release          # binary: .build/release/FrameInterp
 ./make-app.sh                   # FrameInterp.app (ad-hoc signed)
 ./make-release.sh               # DMG in the parent folder
 ```
+
+Native Xbox streaming needs the WebRTC framework (a community build of Google WebRTC, BSD license), which is not
+in the repository. Run `tools/fetch-webrtc.sh` once to download it into `Vendor/` and verify its checksum;
+`./make-app.sh` then builds with native streaming. Without it, the app is built without native streaming.
 
 Requires Xcode 26 / Swift 6 toolchain on macOS 26+. Useful command-line flags for development:
 
