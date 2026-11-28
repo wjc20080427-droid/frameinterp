@@ -1523,6 +1523,10 @@ struct SettingsPanel: View {
                 "最锐 1.0：最强；文字边缘可能出现白边，草地闪烁，不建议一直开",
             ][autoOn ? 0 : model.sharpLevel] + "。只加强明暗边缘，不出彩边")
             if !model.enhanceStatus.isEmpty { Hint(model.enhanceStatus) }
+            #if FI_XNATIVE
+            // 2026-11-28 用户：AI 超分开关要在「画质」里（原来只在「输入 → 串流」和首页齿轮里，找不到）
+            XboxSRField(active: (model.selectedID ?? "").hasPrefix("xbox:") && model.sourceW == SuperRes720.inW && model.sourceH == SuperRes720.inH)
+            #endif
         }
     }
 

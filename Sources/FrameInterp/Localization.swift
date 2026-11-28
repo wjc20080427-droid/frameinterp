@@ -336,6 +336,20 @@ enum EN {
         "正在建立连接…": "Connecting…", "建 WebRTC 连接失败": "Couldn't create the WebRTC connection",
         "生成 offer 失败": "Couldn't create an offer", "主机没给 answer": "The console sent no answer", "正在连接主机…": "Connecting to the console…",
         "不用采集卡": "No capture card needed",
+        "串流设置": "Stream Settings",
+        "下次连接生效": "Applies next connection", "开发中": "In development",
+        "走公网时的码率和分辨率": "Bitrate and resolution over the internet",
+        "现在走公网时主机多半只给 720p，会自动 AI 超分到 1080p；提高公网码率和分辨率还在做": "Over the internet the console usually sends only 720p, which is AI-upscaled to 1080p automatically; raising internet bitrate and resolution is still in progress",
+        "Wi-Fi 防卡顿（关 AWDL）": "Wi-Fi stutter fix (turn off AWDL)", "一键关闭": "Turn Off", "恢复": "Restore",
+        "这台 Mac 没有 AWDL 网卡，不用管": "This Mac has no AWDL interface — nothing to do",
+        "AWDL 开着：Wi-Fi 串流可能每 0.5 秒顿一下。关掉要输一次电脑密码": "AWDL is on: Wi-Fi streaming may hitch every 0.5 s. Turning it off asks for your Mac password once",
+        "已关：串流更稳。隔空投送、接力、随航暂时不能用；点「恢复」或重启电脑就回来": "Off: steadier streaming. AirDrop, Handoff and Sidecar are unavailable until you click Restore or restart",
+        "FrameInterp 要恢复 AWDL（隔空投送 / 接力）。": "FrameInterp wants to restore AWDL (AirDrop / Handoff).",
+        "FrameInterp 要临时关闭 AWDL（隔空投送 / 接力），让 Wi-Fi 串流不再周期性卡顿。": "FrameInterp wants to temporarily turn off AWDL (AirDrop / Handoff) to stop periodic Wi-Fi streaming stutter.",
+        "串流 720p 自动 AI 超分到 1080p": "Auto AI upscale 720p streams to 1080p",
+        "正在超分：主机发来 1280×720，用 Apple 的 AI 超分升到 1920×1080，每帧多约 3～7ms": "Upscaling now: the console sends 1280×720, Apple's AI super resolution upscales it to 1920×1080 (about 3–7 ms per frame)",
+        "原生 Xbox 串流时主机只给 720p（多半是走公网），自动用 Apple 的 AI 超分升到 1080p，压缩块和锯齿更少；每帧多约 3～7ms": "When native Xbox streaming only gets 720p (usually over the internet), Apple's AI super resolution automatically upscales it to 1080p with fewer compression blocks and jaggies; about 3–7 ms per frame",
+        "，AI 超分到 1920×1080": ", AI-upscaled to 1920×1080",
     ]
 
     /// 带数字 / 名字的句子：{} 是会变的部分

@@ -69,9 +69,15 @@ enum XboxQuality {
 final class XboxStreamSession: NSObject {
     let console: XboxConsole
     /// 画面（在 WebRTC 的解码线程上回调）：已转成补帧要的尺寸和格式
+    /// 主机只给 720p 时先 AI 超分到 1080p 再交出去（SuperRes.swift；开关 xboxSR.v1，连接中切换立刻生效）
+    nonisolated let superRes = SuperRes720()
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)? {
         get { sink.onFrame }
-        set { sink.onFrame = newValue }
+        set {
+            guard let f = newValue else { sink.onFrame = nil; return }
+            let sr = superRes
+            sink.onFrame = { pb, pts in f(sr?.process(pb, pts: pts) ?? pb, pts) }
+        }
     }
     var onStatus: ((String) -> Void)?
     var onEnded: ((String) -> Void)?
@@ -91,10 +97,12 @@ final class XboxStreamSession: NSObject {
     private var timers: [Timer] = []
     private let sink: FrameSink
     private let input = XboxInput()
+    private let rumble = XboxRumble()
     private var stopped = false
     private var localCandidates: [RTCIceCandidate] = []
     private var gathered = false
     private var connectedAt: Date?
+    private var videoPkts = -1, videoStall = 0   // 画面卡住检测（2026-11-28：主机连上 7 秒后只发声音不发画面）
 
     init?(console: XboxConsole, width: Int, height: Int, pixelFormat: OSType) {
         guard let gs = XboxAccount.shared.gsToken, let b = XboxAccount.shared.baseURI else { return nil }
@@ -164,6 +172,7 @@ final class XboxStreamSession: NSObject {
         stopped = true
         timers.forEach { $0.invalidate() }; timers = []
         input.stop()
+        rumble.stop()
         videoTrack?.remove(sink); videoTrack = nil
         pc?.close(); pc = nil
         channels = [:]
@@ -265,7 +274,8 @@ final class XboxStreamSession: NSObject {
             let f = c.sdp.split(separator: " "); return f.count > 7 ? "\(f[4])(\(f[7]))" : "?" }.joined(separator: "、"))
         _ = try await http("POST", sessionPath + "/ice", body: ["candidates": mine])
         let remote = try await pollExchange(sessionPath + "/ice", interval: 1)
-        var n = 0
+        var n = 0, extra = 0
+        var kinds: [String] = []
         for item in remote as? [[String: Any]] ?? [] {
             guard var cand = item["candidate"] as? String, cand != "a=end-of-candidates" else { continue }
             if cand.hasPrefix("a=") { cand.removeFirst(2) }
@@ -273,8 +283,16 @@ final class XboxStreamSession: NSObject {
             let idx = Int32(item["sdpMLineIndex"] as? Int ?? 0)
             try? await pc.add(RTCIceCandidate(sdp: cand, sdpMLineIndex: idx, sdpMid: mid))
             n += 1
+            let f = cand.split(separator: " ")
+            kinds.append(f.count > 7 ? "\(f[4]):\(f[5])(\(f[7]))" : "?")
+            // Teredo：主机给的 2001:0::/32 地址里藏着它在公网上的 IPv4 地址和端口，解出来当直连地址再给一份（公网直连更容易成功）
+            for t in Self.teredoCandidates(cand) {
+                try? await pc.add(RTCIceCandidate(sdp: t, sdpMLineIndex: idx, sdpMid: mid))
+                extra += 1
+                let g = t.split(separator: " "); kinds.append("Teredo→\(g[4]):\(g[5])")
+            }
         }
-        Log.write("原生串流：主机 \(n) 个候选地址")
+        Log.write("原生串流：主机 \(n) 个候选地址" + (extra > 0 ? "，Teredo 解出 \(extra) 个 IPv4 直连地址" : "") + "：" + kinds.joined(separator: "、"))
         status("正在连接主机…")
 
         // 诊断：每 2 秒记一次视频 / 音频接收统计（前 2 分钟，之后每 10 秒）
@@ -318,6 +336,8 @@ final class XboxStreamSession: NSObject {
                             let avgQP = fd > lastFrames ? (qp - lastQP) / (fd - lastFrames) : 0
                             lastBytes = bytes; lastQP = qp; lastFrames = fd
                             lines.append("码率 \(kbps) kbps 平均QP \(Int(avgQP))")
+                            let pk = (v["packetsReceived"] as? NSNumber)?.intValue ?? 0
+                            DispatchQueue.main.async { MainActor.assumeIsolated { self.checkStall(pk) } }
                             func d(_ k: String) -> Double { (v[k] as? NSNumber)?.doubleValue ?? 0 }
                             let jb = d("jitterBufferEmittedCount") > 0 ? d("jitterBufferDelay") / d("jitterBufferEmittedCount") * 1000 : 0
                             let dec = d("framesDecoded") > 0 ? d("totalDecodeTime") / d("framesDecoded") * 1000 : 0
@@ -330,8 +350,15 @@ final class XboxStreamSession: NSObject {
                     lines.append(bwe)
                     let ps = self.sink.takePacingStats()
                     lines.append(ps.on ? "平滑缓冲 余量 \(String(format: "%.1f", ps.margin))ms 来晚 \(ps.late) \(ps.detail)" : "平滑缓冲关")
-                    let msg = (lines.isEmpty ? "还没有收到媒体流" : lines.joined(separator: " | ")) + " | 接收器收到 \(self.sink.calls) 帧"
-                    DispatchQueue.main.async { Log.write("原生串流统计：" + msg) }
+                    var srText = ""
+                    if let (avg, mx, cnt) = self.superRes?.takeStats(), cnt > 0 { srText = String(format: " | AI 超分 %d 帧 平均 %.1fms 最慢 %.1fms", cnt, avg, mx) }
+                    let msg = (lines.isEmpty ? "还没有收到媒体流" : lines.joined(separator: " | ")) + " | 接收器收到 \(self.sink.calls) 帧 | 手柄包 \(self.input.sent)" + srText
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            let (rc, peak) = self.rumble.takeStats()
+                            Log.write("原生串流统计：" + msg + (rc > 0 ? " | 震动 \(rc) 条 最强 \(Int(peak * 100))%" : ""))
+                        }
+                    }
                 }
             }
         })
@@ -362,6 +389,39 @@ final class XboxStreamSession: NSObject {
     }
 
     /// 轮询 GET：没准备好时返回 204 / 空；准备好时 exchangeResponse 是一段 JSON 字符串
+    /// Teredo（RFC 4380）地址 2001:0000:服务器IPv4:标志:端口^FFFF:客户端IPv4^FFFFFFFF。客户端 IPv4 + 端口就是主机在公网上的映射地址。
+    /// 输入一行候选（不带 a=），返回额外的 IPv4 host 候选：映射地址 + 映射端口、映射地址 + 原端口（重复的去掉）
+    nonisolated static func teredoCandidates(_ cand: String) -> [String] {
+        let f = cand.split(separator: " ").map(String.init)
+        guard f.count > 7, f[2].uppercased() == "UDP", let port = Int(f[5]),
+              let segs = ipv6Segments(f[4]), segs.count == 8, segs[0] == 0x2001, segs[1] == 0 else { return [] }
+        let mappedPort = Int(segs[5] ^ 0xFFFF)
+        let hi = segs[6] ^ 0xFFFF, lo = segs[7] ^ 0xFFFF
+        let ip = "\(hi >> 8).\(hi & 0xFF).\(lo >> 8).\(lo & 0xFF)"
+        let prio = max(1, (Int(f[3]) ?? 2_122_260_223) - 1)
+        var out: [String] = []
+        for (i, p) in [mappedPort, port].enumerated() where p > 0 && !(i == 1 && p == mappedPort) {
+            out.append("candidate:\(f[0].replacingOccurrences(of: "candidate:", with: ""))\(90 + i) 1 UDP \(prio - i) \(ip) \(p) typ host")
+        }
+        return out
+    }
+
+    /// 把 IPv6 文本拆成 8 段（支持 :: 缩写）
+    nonisolated static func ipv6Segments(_ s: String) -> [UInt16]? {
+        guard s.contains(":"), !s.contains(".") else { return nil }
+        let parts = s.components(separatedBy: "::")
+        guard parts.count <= 2 else { return nil }
+        func segs(_ t: String) -> [UInt16]? {
+            if t.isEmpty { return [] }
+            let v = t.split(separator: ":", omittingEmptySubsequences: false).map { UInt16($0, radix: 16) }
+            return v.contains(where: { $0 == nil }) ? nil : v.map { $0! }
+        }
+        guard let a = segs(parts[0]) else { return nil }
+        if parts.count == 1 { return a.count == 8 ? a : nil }
+        guard let b = segs(parts[1]), a.count + b.count < 8 else { return nil }
+        return a + Array(repeating: 0, count: 8 - a.count - b.count) + b
+    }
+
     private func pollExchange(_ path: String, interval: Double) async throws -> Any {
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
@@ -442,7 +502,8 @@ final class XboxStreamSession: NSObject {
                 sendConfig()
             case "TransactionStart", "Message":
                 let target = m["target"] as? String ?? ""
-                Log.write("原生串流：主机消息 \(target)")
+                let content = (m["content"] as? String).map { String($0.prefix(160)) } ?? ""
+                Log.write("原生串流：主机消息 \(target)（\(m["type"] as? String ?? "?")）\(content.isEmpty ? "" : " " + content)")
                 if target == "/streaming/sessionLifetimeManagement/serverInitiatedDisconnect" {
                     completeTransaction(m["id"] as? String ?? "", "")
                     stop("主机断开了")
@@ -458,11 +519,26 @@ final class XboxStreamSession: NSObject {
                 let h = data.subdata(in: 2..<6).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
                 let w = data.subdata(in: 6..<10).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
                 Log.write("原生串流：主机画面 \(w)×\(h)")
-            } else if type & 128 != 0 {
-                // 震动（待做）
             }
+            if let r = RumbleCommand.parse(data) { rumble.handle(r) }
         default: break
         }
+    }
+
+    /// 每 2 秒（统计时）看一次视频包数：不涨了说明主机不发画面了，请求关键帧并记日志
+    private func checkStall(_ pk: Int) {
+        guard connectedAt != nil, !stopped else { return }
+        if pk == videoPkts {
+            videoStall += 1
+            if videoStall == 2 || videoStall % 5 == 0 {
+                Log.write("原生串流：画面停了约 \(videoStall * 2) 秒（视频包停在 \(pk)，声音照常），请求关键帧；手柄包已发 \(input.sent)")
+                send("control", ["message": "videoKeyframeRequested", "ifrRequested": true])
+            }
+        } else {
+            if videoStall >= 2 { Log.write("原生串流：画面恢复（停了约 \(videoStall * 2) 秒）") }
+            videoStall = 0
+        }
+        videoPkts = pk
     }
 
     private func sendConfig() {
@@ -697,6 +773,8 @@ final class XboxInput: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private let t0 = CACurrentMediaTime()
     private var latestPad: [UInt8]?
+    private var hadPad = false
+    static let neutralPad: [UInt8] = [0, 0, 0] + [UInt8](repeating: 0, count: 12) + [1, 0, 0, 0] + [0, 0, 0, 1]
 
     private func ms() -> Double { (CACurrentMediaTime() - t0) * 1000 }
 
@@ -713,7 +791,15 @@ final class XboxInput: @unchecked Sendable {
         timer = t
     }
 
-    func stop() { timer?.cancel(); timer = nil }
+    func stop() {
+        timer?.cancel(); timer = nil
+        // Xbox 键还给系统（开「游戏」App 那些）
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                for c in GCController.controllers() { c.extendedGamepad?.buttonHome?.preferredSystemGestureState = .enabled }
+            }
+        }
+    }
 
     /// 每个视频帧一条（服务器用它算延迟）
     func queueMetadata(key: UInt32, arrivalMs: Double) {
@@ -725,17 +811,32 @@ final class XboxInput: @unchecked Sendable {
 
     /// 主线程：每 16ms 读一次手柄
     @MainActor private func tick() {
-        guard let g = GCController.controllers().first(where: { $0.extendedGamepad != nil })?.extendedGamepad else { return }
-        let frame = XboxInput.encodePad(g)
+        // 没连手柄也发"手柄 0 什么都没按"，让主机知道客户端还在（主机收不到输入会停画面、最后断开）
+        let frame: [UInt8]
+        if let g = GCController.controllers().first(where: { $0.extendedGamepad != nil })?.extendedGamepad {
+            if !hadPad { hadPad = true; Log.write("原生串流：手柄已接上（\(GCController.controllers().first?.vendorName ?? "?")）") }
+            // Xbox 键默认被 macOS 拿去开「游戏」App / 游戏叠层，FrameInterp 收不到（2026-11-28 用户反馈）。
+            // 串流时关掉这个键的系统手势，按键就交给我们发给主机；断开时恢复（stop）
+            if let home = g.buttonHome, home.preferredSystemGestureState != .disabled {
+                home.preferredSystemGestureState = .disabled
+                Log.write("原生串流：手柄 Xbox 键交给主机（关掉 macOS 的系统手势）")
+            }
+            frame = XboxInput.encodePad(g)
+        } else {
+            if hadPad { hadPad = false; Log.write("原生串流：手柄断开了，改发空手柄状态") }
+            frame = XboxInput.neutralPad
+        }
         q.async {
             self.pads.append(frame)
             self.flush(force: false)
         }
     }
 
-    /// 和参考客户端一样：有视频帧信息时，连同手柄状态一起发；视频帧信息攒到 6 条也发
+    /// 手柄状态每 16ms 发一次（顺带这期间攒下的视频帧信息）；没手柄时视频帧信息攒到 6 条发。
+    /// 2026-11-28 修：原来手柄状态只跟着视频帧信息一起发——主机一不发画面，我们就一个包都不发，
+    /// 主机等不到输入也不发画面，60 秒后以 KickForNoClientConnection 断开（画面卡住 / 一直"正在接收画面"）
     private func flush(force: Bool) {
-        guard force || metadata.count > 5 || (!metadata.isEmpty && !pads.isEmpty) else { return }
+        guard force || metadata.count > 5 || !pads.isEmpty else { return }
         seq &+= 1
         var type: UInt16 = 0
         if !metadata.isEmpty { type |= 1 }
@@ -764,8 +865,10 @@ final class XboxInput: @unchecked Sendable {
         return p
     }
 
+    private(set) var sent = 0
     private func sendRaw(_ bytes: [UInt8]) {
         guard let ch = channel, ch.readyState == .open else { return }
+        sent += 1
         ch.sendData(RTCDataBuffer(data: Data(bytes), isBinary: true))
     }
 

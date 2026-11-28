@@ -222,6 +222,17 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
         XboxAccount.shared.restore()   // 原生 Xbox 串流（开发中）：钥匙串里有登录就自动登录
         if ProcessInfo.processInfo.environment["FI_XLOGIN"] == "1" { XboxAccount.shared.signIn() }   // 测试：启动就申请登录码（截图看界面）
         if ProcessInfo.processInfo.environment["FI_XRTCTEST"] == "1" { XboxRTC.selfTest() }   // 测试：WebRTC 能不能用
+        if ProcessInfo.processInfo.environment["FI_XRUMBLETEST"] == "1" { XboxRumbleTest.run() }   // 测试：震动包解析 + 手柄震一下
+        if ProcessInfo.processInfo.environment["FI_SRTEST"] == "1" { SuperResTest.run() }   // 测试：AI 超分
+        // 测试：Teredo 地址解析（RFC 4380 的例子：2001:0:4136:e378:8000:63bf:3fff:fdd2 → 192.0.2.45 端口 40000）
+        if ProcessInfo.processInfo.environment["FI_TEREDOTEST"] == "1" {
+            for c in ["candidate:1 1 UDP 2122260223 2001:0000:4136:e378:8000:63bf:3fff:fdd2 9002 typ host",
+                      "candidate:2 1 UDP 2122260223 2001:0:4136:e378:8000:63bf:3fff:fdd2 40000 typ host",
+                      "candidate:3 1 UDP 2122260223 192.168.1.20 9002 typ host",
+                      "candidate:4 1 UDP 2122260223 fe80::1 9002 typ host"] {
+                Log.write("Teredo 自测：\(c.split(separator: " ")[4]) → \(XboxStreamSession.teredoCandidates(c))")
+            }
+        }
         // 测试：FI_XCONNECT=主机名，自动登录后直接连这台主机（最多等 20 秒拿主机列表）
         if let name = ProcessInfo.processInfo.environment["FI_XCONNECT"] {
             Task { @MainActor in
@@ -1326,12 +1337,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelega
             }
             sess.onFrame = { pb, pts in p.handle(pb, pts: pts) }
             // 界面上的分辨率按主机实际发来的显示（局域网 1440p、公网常是 720p）
-            sess.onSize = { [weak self] w, h in
+            sess.onSize = { [weak self, weak sess] w, h in
                 guard let self else { return }
                 if model.nativeConnecting != nil { withAnimation(.easeOut(duration: 0.35)) { self.model.nativeConnecting = nil } }
                 model.sourceW = w; model.sourceH = h
-                scaler?.sourceHeight = h
-                model.inputDetail = "\(w)×\(h)（主机发来的）" + (h > 1080 ? "，补帧在 1920×1080 上做" : "")
+                let sr = w == SuperRes720.inW && h == SuperRes720.inH && SuperRes720.enabled && sess?.superRes != nil
+                scaler?.sourceHeight = sr ? SuperRes720.outH : h
+                model.inputDetail = "\(w)×\(h)（主机发来的）" + (h > 1080 ? "，补帧在 1920×1080 上做" : sr ? "，AI 超分到 1920×1080" : "")
+                if sr { Log.write("原生串流：主机发 720p，AI 超分到 1080p") }
             }
             // 连接过程盖绿色光球加载画面，第一帧画面到了再收起
             model.nativeConnecting = (title: "正在连接 \(con.name)", step: "正在请求主机串流…")

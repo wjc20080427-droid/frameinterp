@@ -325,15 +325,26 @@ struct XboxNativeRow: View {
                     Text(gt).font(.system(size: 12, weight: .semibold)).lineLimit(1)
                     Text("· \(XboxQuality.height)p").font(.system(size: 11)).foregroundStyle(Theme.muted)
                     Spacer(minLength: 4)
+                    // 2026-11-28 用户：齿轮太不显眼——改成带文字的主色胶囊按钮
                     Button { showSettings.toggle() } label: {
-                        Image(systemName: "gearshape").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.muted)
-                            .frame(width: 26, height: 24)
-                            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.borderHover))
-                            .contentShape(Rectangle())
+                        HStack(spacing: 5) {
+                            Image(systemName: "slider.horizontal.3").font(.system(size: 11, weight: .bold))
+                            Text("串流设置").font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundStyle(Theme.accent)
+                        .padding(.horizontal, 10).frame(height: 26)
+                        .background(Theme.accent.opacity(showSettings ? 0.28 : 0.16), in: Capsule())
+                        .overlay(Capsule().strokeBorder(Theme.accent.opacity(0.45)))
+                        .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
                     .help("Xbox 串流设置")
                     .popover(isPresented: $showSettings, arrowEdge: .bottom) { XboxSettingsPopover(acc: acc) }
+                    .onAppear {   // 测试：FI_XPOPOVER=1 启动后自动打开齿轮设置（截图看界面）
+                        if ProcessInfo.processInfo.environment["FI_XPOPOVER"] == "1" {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showSettings = true }
+                        }
+                    }
                 }
                 .padding(.horizontal, 2)
                 if acc.consoles.isEmpty && acc.loadingConsoles {
@@ -365,8 +376,20 @@ struct XboxSettingsPopover: View {
                 }
                 Text(res == 1440 ? "1440p：局域网、网速好时用，Series X / S 都支持" : res == 720 ? "720p：网络差时更稳" : "1080p：一般用这个")
                     .font(.system(size: 11)).foregroundStyle(Theme.muted)
-                Text("下次连接生效。走公网时主机会按网速自己降分辨率").font(.system(size: 11)).foregroundStyle(Theme.faint)
+                Text("下次连接生效").font(.system(size: 11)).foregroundStyle(Theme.faint)
+                // 2026-11-28 用户：公网码率 / 分辨率还没解决，标开发中（主机走公网多半只给 720p，Google WebRTC 发不了 REMB 推码率）
+                HStack(spacing: 6) {
+                    Text("走公网时的码率和分辨率").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.muted)
+                    Text("开发中").font(.system(size: 10, weight: .bold)).foregroundStyle(Theme.amber)
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(Theme.amber.opacity(0.15), in: Capsule())
+                }
+                Text("现在走公网时主机多半只给 720p，会自动 AI 超分到 1080p；提高公网码率和分辨率还在做").font(.system(size: 11)).foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            XboxSRField()
+            Theme.border.frame(height: 1)
+            AWDLField()
             Theme.border.frame(height: 1)
             HStack(spacing: 8) {
                 SmallButton(title: "刷新主机列表") { acc.reloadConsoles() }
@@ -388,6 +411,20 @@ struct XboxQualityField: View {
             Segmented(labels: ["720p", "1080p", "1440p"], selection: [720, 1080, 1440].firstIndex(of: res) ?? 1) { i in
                 res = [720, 1080, 1440][i]; XboxQuality.height = res
             }
+        }
+    }
+}
+
+/// AI 超分开关（首页齿轮、设置里同一个）：主机只给 720p 时用 Apple 的 AI 超分升到 1080p，连接中切换立刻生效
+struct XboxSRField: View {
+    var active = false   // 现在正在超分（原生串流、主机发 720p）
+    @State private var on = SuperRes720.enabled
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SwitchLine(title: "串流 720p 自动 AI 超分到 1080p", isOn: Binding(get: { on }, set: { on = $0; SuperRes720.setEnabled($0) }))
+            Text(on && active ? "正在超分：主机发来 1280×720，用 Apple 的 AI 超分升到 1920×1080，每帧多约 3～7ms"
+                 : "原生 Xbox 串流时主机只给 720p（多半是走公网），自动用 Apple 的 AI 超分升到 1080p，压缩块和锯齿更少；每帧多约 3～7ms")
+                .font(.system(size: 11)).foregroundStyle(on && active ? Theme.ok : Theme.muted).fixedSize(horizontal: false, vertical: true)
         }
     }
 }
